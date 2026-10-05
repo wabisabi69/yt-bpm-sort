@@ -110,6 +110,19 @@ def _norm(x):
 
 
 def lookup_bpm(api_key, artist, song):
+    bpm, source = _lookup_once(api_key, artist, song)
+    if bpm:
+        return bpm, source
+    # Retry with parenthetical or bracketed text stripped, e.g.
+    # "Sunflower (Spider-Man: Into the Spider-Verse)" -> "Sunflower"
+    bare = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", song).strip()
+    if bare and bare != song:
+        time.sleep(1)
+        return _lookup_once(api_key, artist, bare)
+    return bpm, source
+
+
+def _lookup_once(api_key, artist, song):
     if artist:
         params = {"api_key": api_key, "type": "both", "lookup": f"song:{song} artist:{artist}"}
     else:
