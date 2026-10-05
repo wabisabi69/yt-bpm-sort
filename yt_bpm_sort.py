@@ -258,13 +258,41 @@ def apply_follows(ordered):
     return ordered
 
 
+def _longest_increasing_subsequence(seq):
+    """Indices into seq forming one longest strictly increasing subsequence."""
+    import bisect
+    tails, tails_idx, prev = [], [], [-1] * len(seq)
+    for i, v in enumerate(seq):
+        k = bisect.bisect_left(tails, v)
+        if k == len(tails):
+            tails.append(v)
+            tails_idx.append(i)
+        else:
+            tails[k] = v
+            tails_idx[k] = i
+        prev[i] = tails_idx[k - 1] if k else -1
+    out, i = [], tails_idx[-1] if tails_idx else -1
+    while i != -1:
+        out.append(i)
+        i = prev[i]
+    return out[::-1]
+
+
 def plan_moves(current, target_ids):
+    """Minimal moves: items already in correct relative order (the longest
+    increasing subsequence) stay put; every other item is moved to sit
+    directly after its predecessor in the target order."""
+    rank = {item_id: i for i, item_id in enumerate(target_ids)}
+    seq = [rank[i] for i in current]
+    keep = {current[i] for i in _longest_increasing_subsequence(seq)}
+
     current = list(current)
     moves = []
-    for pos, item_id in enumerate(target_ids):
-        if current[pos] == item_id:
+    for i, item_id in enumerate(target_ids):
+        if item_id in keep:
             continue
         current.remove(item_id)
+        pos = current.index(target_ids[i - 1]) + 1 if i else 0
         current.insert(pos, item_id)
         moves.append((pos, item_id))
     return moves
