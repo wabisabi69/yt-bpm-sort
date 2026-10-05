@@ -1,0 +1,7 @@
+client_secret.json
+client_secret_*.json
+token.json
+playlist_bpm.csv
+__pycache__/
+.venv/
+HANDOVER*.md
