@@ -35,7 +35,7 @@ TOKEN_FILE = "token.json"
 GETSONGBPM_URL = "https://api.getsong.co/search/"
 UPDATE_COST = 50  # quota units per playlistItems.update
 FIELDS = ["playlist_id", "position", "playlist_item_id", "video_id", "title",
-          "channel", "artist_guess", "song_guess", "bpm", "bpm_source"]
+          "channel", "artist_guess", "song_guess", "bpm", "bpm_source", "follows"]
 SKIP_TITLES = {"Deleted video", "Private video"}
 
 
@@ -153,13 +153,16 @@ def cmd_export(args):
     if not api_key:
         print("No GetSongBPM key given, so the BPM column will be left blank for you to fill in.")
 
-    # Keep BPMs you already entered if the CSV exists
+    # Keep BPMs and follows rules you already entered if the CSV exists
     previous = {}
+    follows_prev = {}
     if os.path.exists(args.out):
         with open(args.out, newline="", encoding="utf-8-sig") as f:
             for row in csv.DictReader(f):
                 if row.get("bpm"):
                     previous[row["playlist_item_id"]] = (row["bpm"], row.get("bpm_source", ""))
+                if row.get("follows"):
+                    follows_prev[row["playlist_item_id"]] = row["follows"]
         print(f"Reusing {len(previous)} BPM values from existing {args.out}")
 
     yt = get_youtube()
@@ -191,6 +194,7 @@ def cmd_export(args):
             "song_guess": song,
             "bpm": bpm,
             "bpm_source": source,
+            "follows": follows_prev.get(it["id"], ""),
         })
         print(f"{sn['position']:>4}  {bpm or '---':>6}  {title}")
 
@@ -211,7 +215,47 @@ def build_target(rows, descending):
             return (0, -b if descending else b)
         except (TypeError, ValueError):
             return (1, 0)  # no BPM: keep at the end, in current order
-    return sorted(rows, key=key)
+    ordered = sorted(rows, key=key)
+    return apply_follows(ordered)
+
+
+def apply_follows(ordered):
+    """Move any row with a 'follows' value to directly after its anchor.
+
+    The follows column can name the anchor's title, song_guess, video_id or
+    playlist_item_id (case-insensitive). Unknown anchors are reported and
+    skipped. Chains work (C follows B follows A) as long as the CSV lists
+    them in a consistent direction; a row never follows itself.
+    """
+    def norm(s):
+        return (s or "").strip().lower()
+
+    for _ in range(len(ordered)):  # enough passes to settle any chain
+        moved = False
+        for row in list(ordered):
+            want = norm(row.get("follows"))
+            if not want:
+                continue
+            anchor = next(
+                (a for a in ordered if a is not row and want in (
+                    norm(a["title"]), norm(a["song_guess"]),
+                    norm(a["video_id"]), norm(a["playlist_item_id"]))),
+                None,
+            )
+            if anchor is None:
+                print(f"follows: no track matching '{row['follows']}' for '{row['title']}', ignoring")
+                row["follows"] = ""
+                continue
+            ai = ordered.index(anchor)
+            ri = ordered.index(row)
+            if ri == ai + 1:
+                continue
+            ordered.remove(row)
+            ordered.insert(ordered.index(anchor) + 1, row)
+            moved = True
+        if not moved:
+            break
+    return ordered
 
 
 def plan_moves(current, target_ids):
@@ -271,6 +315,100 @@ def cmd_apply(args):
     print("\nDone. Playlist is sorted.")
 
 
+def deezer_find_preview(artist, song):
+    """Return (preview_url, 'Title / Artist') for the best Deezer match, or (None, why)."""
+    q = f"{song} {artist}".strip()
+    try:
+        r = requests.get("https://api.deezer.com/search",
+                         params={"q": q, "limit": 5}, timeout=15)
+        r.raise_for_status()
+        data = r.json().get("data") or []
+    except (requests.RequestException, ValueError) as e:
+        return None, f"deezer error: {e}"
+    if not data:
+        return None, "deezer: no result"
+    hit = next(
+        (t for t in data if artist and _norm(t["artist"]["name"]) == _norm(artist)),
+        data[0],
+    )
+    if not hit.get("preview"):
+        return None, "deezer: match has no preview"
+    return hit["preview"], f"{hit['title']} / {hit['artist']['name']}"
+
+
+def estimate_bpm_from_url(url):
+    """Download a Deezer 30s preview and estimate tempo from its middle 20s."""
+    import os
+    import tempfile
+    import librosa
+    import soundfile as sf
+
+    audio = requests.get(url, timeout=30).content
+    # libsndfile's mp3 sniffing fails on BytesIO, so go through a temp file
+    fd, path = tempfile.mkstemp(suffix=".mp3")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(audio)
+        y, sr = sf.read(path, dtype="float32", always_2d=True)
+    finally:
+        os.unlink(path)
+    y = y.mean(axis=1)
+    # Previews are mid-song clips; trim another 5s each side to dodge fades
+    if len(y) > 20 * sr:
+        edge = 5 * sr
+        y = y[edge:-edge]
+    tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+    # librosa may return a 1-element array
+    import numpy as np
+    return float(np.atleast_1d(tempo)[0])
+
+
+def fold_bpm(bpm, lo=70, hi=180):
+    """Fold octave errors into a sane range; returns (folded, was_folded)."""
+    folded = bpm
+    while folded < lo:
+        folded *= 2
+    while folded > hi:
+        folded /= 2
+    return round(folded, 1), folded != bpm
+
+
+def cmd_fill(args):
+    with open(args.csv, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+    blanks = [r for r in rows if not (r.get("bpm") or "").strip()
+              and r["title"] not in SKIP_TITLES]
+    print(f"{len(blanks)} rows without BPM. Trying Deezer previews...")
+
+    filled = 0
+    for r in blanks:
+        label = f"{r['artist_guess']} - {r['song_guess']}"
+        url, matched = deezer_find_preview(r["artist_guess"], r["song_guess"])
+        if not url:
+            print(f"  skip  {label}  ({matched})")
+            time.sleep(args.delay)
+            continue
+        try:
+            raw = estimate_bpm_from_url(url)
+        except Exception as e:
+            print(f"  skip  {label}  (analysis failed: {e})")
+            time.sleep(args.delay)
+            continue
+        bpm, was_folded = fold_bpm(raw)
+        note = f" (raw {raw:.1f})" if was_folded else ""
+        r["bpm"] = str(bpm)
+        r["bpm_source"] = f"deezer_preview:librosa: {matched}{note}"
+        filled += 1
+        print(f"  {bpm:>6}  {label}  <- {matched}{note}")
+        time.sleep(args.delay)
+
+    with open(args.csv, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=FIELDS)
+        w.writeheader()
+        w.writerows(rows)
+    print(f"\nFilled {filled} of {len(blanks)} blank rows. Review the CSV, then run 'apply'.")
+
+
 def main():
     p = argparse.ArgumentParser(description="Sort a YouTube playlist by BPM")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -281,6 +419,11 @@ def main():
     e.add_argument("--out", default="playlist_bpm.csv")
     e.add_argument("--delay", type=float, default=0.5, help="Seconds between BPM lookups")
     e.set_defaults(func=cmd_export)
+
+    fl = sub.add_parser("fill", help="Fill blank BPMs by analysing Deezer 30s previews locally")
+    fl.add_argument("csv", nargs="?", default="playlist_bpm.csv")
+    fl.add_argument("--delay", type=float, default=0.5, help="Seconds between Deezer lookups")
+    fl.set_defaults(func=cmd_fill)
 
     a = sub.add_parser("apply", help="Reorder the playlist using the CSV")
     a.add_argument("csv", nargs="?", default="playlist_bpm.csv")
