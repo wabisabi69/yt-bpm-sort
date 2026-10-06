@@ -343,7 +343,12 @@ def cmd_apply(args):
         print(f"  [{done}/{len(moves)}] {pos:>4}: {it['snippet']['title']}")
     # YouTube accepts position updates even when the playlist's default
     # ordering is not Manual, then keeps showing its own order. Verify.
-    after = [i["id"] for i in fetch_items(yt, pid)]
+    # Listings lag behind updates by a little while, so retry before warning.
+    for wait in (15, 45, 90):
+        time.sleep(wait)
+        after = [i["id"] for i in fetch_items(yt, pid)]
+        if after == target_ids:
+            break
     if after != target_ids:
         stuck = sum(1 for a, b in zip(after, target_ids) if a == b)
         print(f"\nWARNING: YouTube reports only {stuck}/{len(target_ids)} tracks in the "
