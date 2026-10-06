@@ -5,3 +5,5 @@ playlist_bpm.csv
 __pycache__/
 .venv/
 HANDOVER*.md
+apply_log.txt
+playlist_bpm.backup.csv
