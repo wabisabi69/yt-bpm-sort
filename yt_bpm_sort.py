@@ -392,7 +392,12 @@ def estimate_bpm_from_url(url):
 
 
 def fold_bpm(bpm, lo=70, hi=180):
-    """Fold octave errors into a sane range; returns (folded, was_folded)."""
+    """Fold octave errors into a sane range; returns (folded, was_folded).
+
+    Returns (None, False) for a non-positive tempo, which librosa reports
+    for silent or beatless audio."""
+    if not bpm or bpm <= 0:
+        return None, False
     folded = bpm
     while folded < lo:
         folded *= 2
@@ -406,34 +411,43 @@ def cmd_fill(args):
         rows = list(csv.DictReader(f))
     blanks = [r for r in rows if not (r.get("bpm") or "").strip()
               and r["title"] not in SKIP_TITLES]
-    print(f"{len(blanks)} rows without BPM. Trying Deezer previews...")
+    print(f"{len(blanks)} rows without BPM. Trying Deezer previews...", flush=True)
+
+    def save():
+        with open(args.csv, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=FIELDS)
+            w.writeheader()
+            w.writerows(rows)
 
     filled = 0
-    for r in blanks:
-        label = f"{r['artist_guess']} - {r['song_guess']}"
+    for n, r in enumerate(blanks, 1):
+        label = f"[{n}/{len(blanks)}] {r['artist_guess']} - {r['song_guess']}"
         url, matched = deezer_find_preview(r["artist_guess"], r["song_guess"])
         if not url:
-            print(f"  skip  {label}  ({matched})")
+            print(f"  skip  {label}  ({matched})", flush=True)
             time.sleep(args.delay)
             continue
         try:
             raw = estimate_bpm_from_url(url)
         except Exception as e:
-            print(f"  skip  {label}  (analysis failed: {e})")
+            print(f"  skip  {label}  (analysis failed: {e})", flush=True)
             time.sleep(args.delay)
             continue
         bpm, was_folded = fold_bpm(raw)
+        if bpm is None:
+            print(f"  skip  {label}  (no beat detected)", flush=True)
+            time.sleep(args.delay)
+            continue
         note = f" (raw {raw:.1f})" if was_folded else ""
         r["bpm"] = str(bpm)
         r["bpm_source"] = f"deezer_preview:librosa: {matched}{note}"
         filled += 1
-        print(f"  {bpm:>6}  {label}  <- {matched}{note}")
+        print(f"  {bpm:>6}  {label}  <- {matched}{note}", flush=True)
+        if filled % 20 == 0:
+            save()  # a crash or kill keeps the work done so far
         time.sleep(args.delay)
 
-    with open(args.csv, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=FIELDS)
-        w.writeheader()
-        w.writerows(rows)
+    save()
     print(f"\nFilled {filled} of {len(blanks)} blank rows. Review the CSV, then run 'apply'.")
 
 
