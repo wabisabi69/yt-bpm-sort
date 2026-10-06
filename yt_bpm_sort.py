@@ -335,7 +335,8 @@ def cmd_apply(args):
             yt.playlistItems().update(part="snippet", body=body).execute()
         except HttpError as e:
             if e.resp.status == 403 and "quota" in str(e).lower():
-                print(f"\nHit the daily quota after {done} moves. Run 'apply' again tomorrow to continue.")
+                print(f"\nHit the daily quota after {done} moves. Run 'apply' again after the quota "
+                      "resets at midnight Pacific time to continue.")
                 return
             raise
         done += 1
