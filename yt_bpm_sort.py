@@ -427,8 +427,11 @@ def estimate_bpm_from_url(url):
     return float(np.atleast_1d(tempo)[0])
 
 
-def fold_bpm(bpm, lo=70, hi=180):
-    """Fold octave errors into a sane range; returns (folded, was_folded).
+FELT_MAX = 145  # sort by felt tempo: 160 "feels like" 80 to most listeners
+
+
+def fold_bpm(bpm, lo=70, hi=FELT_MAX):
+    """Fold into the felt-tempo range; returns (folded, was_folded).
 
     Returns (None, False) for a non-positive tempo, which librosa reports
     for silent or beatless audio."""
