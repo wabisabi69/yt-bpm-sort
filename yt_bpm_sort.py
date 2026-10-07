@@ -358,6 +358,28 @@ def cmd_apply(args):
     print("\nDone. Playlist is sorted.")
 
 
+VARIANT = re.compile(
+    r"sped\s*up|speed\s*up|slowed|reverb|nightcore|remix|\bedit\b|\blive\b|"
+    r"acoustic|instrumental|extended|cover|karaoke|8d",
+    re.I,
+)
+
+
+def _match_score(track, artist, song):
+    """Rank a Deezer result: right artist, exact title, and no version tag
+    (sped up, slowed, remix...) that the YouTube title does not also have."""
+    title = track.get("title", "")
+    score = 0
+    if artist and _norm(track["artist"]["name"]) == _norm(artist):
+        score += 4
+    if _norm(title) == _norm(song):
+        score += 2
+    wanted = {m.lower() for m in VARIANT.findall(song)}
+    got = {m.lower() for m in VARIANT.findall(title)}
+    score -= 3 * len(got - wanted)
+    return score
+
+
 def deezer_find_preview(artist, song):
     """Return (preview_url, 'Title / Artist') for the best Deezer match, or (None, why)."""
     q = f"{song} {artist}".strip()
@@ -370,10 +392,9 @@ def deezer_find_preview(artist, song):
         return None, f"deezer error: {e}"
     if not data:
         return None, "deezer: no result"
-    hit = next(
-        (t for t in data if artist and _norm(t["artist"]["name"]) == _norm(artist)),
-        data[0],
-    )
+    hit = max(data, key=lambda t: _match_score(t, artist, song))
+    if _match_score(hit, artist, song) < 0:
+        return None, f"deezer: only other versions found, e.g. '{hit['title']}'"
     if not hit.get("preview"):
         return None, "deezer: match has no preview"
     return hit["preview"], f"{hit['title']} / {hit['artist']['name']}"
