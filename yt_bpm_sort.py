@@ -213,7 +213,7 @@ def cmd_export(args):
 
 BAND_WIDTH = 4    # BPM: tracks this close are free to reorder for key and energy
 DUP_GAP = 20      # copies of the same song sit at least this many tracks apart
-STAY_WEIGHT = 0.6  # how strongly a band keeps its current order (saves moves)
+STAY_WEIGHT = 0.3  # how strongly a band keeps its current order (saves moves)
 
 
 def _bpm(r):
