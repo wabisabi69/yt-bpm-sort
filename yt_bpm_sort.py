@@ -462,12 +462,16 @@ def cmd_apply(args):
             "snippet": {"playlistId": pid, "resourceId": it["snippet"]["resourceId"], "position": pos},
         }
         try:
-            yt.playlistItems().update(part="snippet", body=body).execute()
+            _run(yt.playlistItems().update(part="snippet", body=body))
         except HttpError as e:
             if _is_quota(e):
                 print(f"\nHit the daily quota after {done} moves. Run 'apply' again after the quota "
                       "resets at midnight Pacific time to continue.")
                 return "quota"
+            if e.resp.status in (409, 500, 502, 503, 504):
+                print(f"  skipped {it['snippet']['title']}: YouTube kept failing ({e.resp.status}); "
+                      "the next run retries it")
+                continue
             raise
         done += 1
         print(f"  [{done}/{len(moves)}] {pos:>4}: {it['snippet']['title']}")
@@ -491,6 +495,19 @@ def cmd_apply(args):
 
 def _is_quota(e):
     return isinstance(e, HttpError) and e.resp.status == 403 and "quota" in str(e).lower()
+
+
+def _run(request, tries=6):
+    """Execute an API request, retrying YouTube's transient errors (409
+    SERVICE_UNAVAILABLE, 5xx) with backoff. Quota and other errors raise."""
+    for n in range(tries):
+        try:
+            return request.execute()
+        except HttpError as e:
+            if e.resp.status in (409, 500, 502, 503, 504) and n < tries - 1:
+                time.sleep(2 ** n)
+                continue
+            raise
 
 
 # ---------- Mood playlists ----------
@@ -540,7 +557,7 @@ def cmd_moods(args):
                                     "description": f"{name} tracks from '{main_title}', "
                                                    "ordered by felt tempo, key and energy."},
                         "status": {"privacyStatus": "private"}}
-                ids[name] = yt.playlists().insert(part="snippet,status", body=body).execute()["id"]
+                ids[name] = _run(yt.playlists().insert(part="snippet,status", body=body))["id"]
                 json.dump(store, open(MOODS_FILE, "w"), indent=1)
                 print(f"Created playlist '{body['snippet']['title']}'")
             _sync_mood(yt, ids[name], name, desired[name])
@@ -563,14 +580,14 @@ def _sync_mood(yt, mpid, name, want):
         else:
             extra.append(i)
     for i in extra:
-        yt.playlistItems().delete(id=i["id"]).execute()
+        _run(yt.playlistItems().delete(id=i["id"]))
     missing = [v for v in want if v not in have]
     print(f"{name}: {len(want)} tracks, {len(have)} present, adding {len(missing)}, "
           f"removing {len(extra)}", flush=True)
     for n, vid in enumerate(missing, 1):
         try:
-            yt.playlistItems().insert(part="snippet", body={"snippet": {
-                "playlistId": mpid, "resourceId": {"kind": "youtube#video", "videoId": vid}}}).execute()
+            _run(yt.playlistItems().insert(part="snippet", body={"snippet": {
+                "playlistId": mpid, "resourceId": {"kind": "youtube#video", "videoId": vid}}}))
         except HttpError as e:
             if _is_quota(e):
                 raise
@@ -589,8 +606,8 @@ def _sync_mood(yt, mpid, name, want):
     moves = plan_moves(current, target)
     for pos, item_id in moves:
         it = next(i for i in items if i["id"] == item_id)
-        yt.playlistItems().update(part="snippet", body={"id": item_id, "snippet": {
-            "playlistId": mpid, "resourceId": it["snippet"]["resourceId"], "position": pos}}).execute()
+        _run(yt.playlistItems().update(part="snippet", body={"id": item_id, "snippet": {
+            "playlistId": mpid, "resourceId": it["snippet"]["resourceId"], "position": pos}}))
     if moves:
         print(f"  {name}: {len(moves)} moves to fix order")
     print(f"  {name}: in order", flush=True)
