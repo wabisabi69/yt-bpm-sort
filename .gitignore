@@ -7,3 +7,5 @@ __pycache__/
 HANDOVER*.md
 apply_log.txt
 playlist_bpm.backup.csv
+config.json
+moods.json
