@@ -310,6 +310,11 @@ def cmd_apply(args):
     live_by_id = {i["id"]: i for i in live}
     current = [i["id"] for i in live]
 
+    # Order rows by live position first: the sort is stable, so tracks with
+    # equal BPM keep their current relative order and cost no moves.
+    live_pos = {item_id: n for n, item_id in enumerate(current)}
+    rows.sort(key=lambda r: live_pos.get(r["playlist_item_id"], len(current)))
+
     target_ids = [r["playlist_item_id"] for r in build_target(rows, args.descending)
                   if r["playlist_item_id"] in live_by_id]
     seen = set(target_ids)
