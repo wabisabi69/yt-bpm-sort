@@ -513,7 +513,8 @@ def _run(request, tries=6):
 # ---------- Mood playlists ----------
 
 MOODS_FILE = "moods.json"
-MOODS = [("Chill", None, 90), ("Mid", 90, 120), ("Hype", 120, None)]  # felt BPM ranges
+# Felt BPM ranges, in the order they are built (each finishes before the next starts)
+MOODS = [("Hype", 120, None), ("Mid", 90, 120), ("Chill", None, 90)]
 
 
 def _mood_of(bpm):
