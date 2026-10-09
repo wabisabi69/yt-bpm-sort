@@ -572,7 +572,15 @@ def cmd_moods(args):
 
 
 def _sync_mood(yt, mpid, name, want):
-    items = fetch_items(yt, mpid)
+    # A just-created playlist can 404 for a short while before it is listable
+    for wait in (0, 5, 15, 30, 60):
+        time.sleep(wait)
+        try:
+            items = fetch_items(yt, mpid)
+            break
+        except HttpError as e:
+            if e.resp.status != 404 or wait == 60:
+                raise
     have, extra = {}, []
     for i in items:
         vid = i["snippet"]["resourceId"].get("videoId")
