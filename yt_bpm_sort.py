@@ -36,9 +36,9 @@ GETSONGBPM_URL = "https://api.getsong.co/search/"
 UPDATE_COST = 50  # quota units per playlistItems.update
 FIELDS = ["playlist_id", "position", "playlist_item_id", "video_id", "title",
           "channel", "artist_guess", "song_guess", "bpm", "bpm_source", "follows",
-          "key", "key_source", "energy"]
+          "key", "key_source", "energy", "mood"]
 # Columns a re-export carries over from the previous CSV for the same item
-KEPT = ["bpm", "bpm_source", "follows", "key", "key_source", "energy"]
+KEPT = ["bpm", "bpm_source", "follows", "key", "key_source", "energy", "mood"]
 SKIP_TITLES = {"Deleted video", "Private video"}
 
 
@@ -198,6 +198,7 @@ def cmd_export(args):
             "key": old.get("key", ""),
             "key_source": old.get("key_source", ""),
             "energy": old.get("energy", ""),
+            "mood": old.get("mood", ""),
         })
         print(f"{sn['position']:>4}  {bpm or '---':>6}  {title}")
 
@@ -517,11 +518,28 @@ MOODS_FILE = "moods.json"
 MOODS = [("Hype", 120, None), ("Mid", 90, 120), ("Chill", None, 90)]
 
 
+HYPE_MIN_ENERGY = 0.0  # Hype must also be at least averagely energetic
+
+
 def _mood_of(bpm):
     for name, lo, hi in MOODS:
         if (lo is None or bpm >= lo) and (hi is None or bpm < hi):
             return name
     return None
+
+
+def mood_for(r):
+    """A 'mood' column value wins. Otherwise tempo decides, except that a
+    fast but calm track goes to Mid rather than Hype."""
+    if r.get("mood") in {m[0] for m in MOODS}:
+        return r["mood"]
+    b = _bpm(r)
+    if b is None:
+        return None
+    m = _mood_of(b)
+    if m == "Hype" and _energy(r) < HYPE_MIN_ENERGY and "kept fast" not in r.get("bpm_source", ""):
+        return "Mid"
+    return m
 
 
 def cmd_moods(args):
@@ -544,7 +562,7 @@ def cmd_moods(args):
         if b is None or not vid or vid in seen or r["title"] in SKIP_TITLES:
             continue
         seen.add(vid)
-        desired[_mood_of(b)].append(vid)
+        desired[mood_for(r)].append(vid)
 
     store = json.load(open(MOODS_FILE)) if os.path.exists(MOODS_FILE) else {}
     ids = store.setdefault(pid, {})
