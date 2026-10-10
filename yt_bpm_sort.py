@@ -138,10 +138,12 @@ def _lookup_once(api_key, artist, song):
         return "", f"error: {e}"
     if not isinstance(results, list) or not results:
         return "", "not found"
-    best = next(
-        (x for x in results if artist and _norm(x.get("artist", {}).get("name")) == _norm(artist)),
-        results[0],
-    )
+    if artist:
+        best = next((x for x in results if artist_ok(x.get("artist", {}).get("name"), artist)), None)
+        if best is None:
+            return "", "only other artists' songs found"
+    else:
+        best = results[0]
     tempo = best.get("tempo")
     if not tempo:
         return "", "match had no tempo"
@@ -676,12 +678,44 @@ VARIANT = re.compile(
 )
 
 
+def _artist_tokens(s):
+    import unicodedata
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(c for c in s if not unicodedata.combining(c)).lower().replace("&", " and ")
+    return re.sub(r"[\W_]+", " ", s).split()
+
+
+def artist_ok(a, b):
+    """Same artist allowing for spelling: accents, '&' vs 'and', word order,
+    and a credited name inside a longer one ('Louis Armstrong And His All Stars')."""
+    import difflib
+    ta, tb = _artist_tokens(a), _artist_tokens(b)
+    if not ta or not tb:
+        return False
+    ja, jb = "".join(ta), "".join(tb)
+    return (ja in jb or jb in ja or set(ta) == set(tb)
+            or difflib.SequenceMatcher(None, ja, jb).ratio() >= 0.75)
+
+
+def title_ok(found, wanted):
+    """Same song title, ignoring bracketed extras, case and punctuation."""
+    import difflib
+
+    def base(s):
+        s = re.sub(r"[\(\[（【][^\)\]）】]*[\)\]）】]", "", s or "")
+        return re.sub(r"[\W_]+", "", s.lower())
+    a, b = base(found), base(wanted)
+    if not a or not b:
+        return False
+    return a in b or b in a or difflib.SequenceMatcher(None, a, b).ratio() >= 0.8
+
+
 def _match_score(track, artist, song):
     """Rank a Deezer result: right artist, exact title, and no version tag
     (sped up, slowed, remix...) that the YouTube title does not also have."""
     title = track.get("title", "")
     score = 0
-    if artist and _norm(track["artist"]["name"]) == _norm(artist):
+    if artist and artist_ok(track["artist"]["name"], artist):
         score += 4
     if _norm(title) == _norm(song):
         score += 2
@@ -706,6 +740,10 @@ def deezer_find_preview(artist, song):
     hit = max(data, key=lambda t: _match_score(t, artist, song))
     if _match_score(hit, artist, song) < 0:
         return None, f"deezer: only other versions found, e.g. '{hit['title']}'"
+    if artist and not artist_ok(hit["artist"]["name"], artist):
+        return None, f"deezer: only other artists, e.g. '{hit['title']} / {hit['artist']['name']}'"
+    if not title_ok(hit["title"], song):
+        return None, f"deezer: only other songs, e.g. '{hit['title']} / {hit['artist']['name']}'"
     if not hit.get("preview"):
         return None, "deezer: match has no preview"
     return hit["preview"], f"{hit['title']} / {hit['artist']['name']}"
@@ -772,15 +810,13 @@ def cmd_fill(args):
     filled = 0
     for n, r in enumerate(blanks, 1):
         label = f"[{n}/{len(blanks)}] {r['artist_guess']} - {r['song_guess']}"
-        url, matched = deezer_find_preview(r["artist_guess"], r["song_guess"])
-        if not url:
-            print(f"  skip  {label}  ({matched})", flush=True)
-            time.sleep(args.delay)
-            continue
         try:
-            raw = estimate_bpm_from_url(url)
+            samples, sr, matched = load_preview(r["artist_guess"], r["song_guess"])
+            raw = estimate_tempo(samples, sr) if samples is not None else None
         except Exception as e:
-            print(f"  skip  {label}  (analysis failed: {e})", flush=True)
+            samples, matched, raw = None, f"analysis failed: {e}", None
+        if samples is None:
+            print(f"  skip  {label}  ({matched})", flush=True)
             time.sleep(args.delay)
             continue
         bpm, was_folded = fold_bpm(raw)
@@ -841,7 +877,8 @@ def itunes_find_preview(artist, song):
         cands = [c for c in cands if c["preview"]]
         if cands:
             best = max(cands, key=lambda c: _match_score(c, artist, song))
-            if _match_score(best, artist, song) >= 2:
+            if _match_score(best, artist, song) >= 2 and title_ok(best["title"], song) and (
+                    not artist or artist_ok(best["artist"]["name"], artist)):
                 return best["preview"], f"{best['title']} / {best['artist']['name']} (itunes)"
     return None, "itunes: no match"
 
@@ -876,6 +913,13 @@ def load_preview(artist, song):
     if len(y) > 20 * sr:
         y = y[5 * sr:-5 * sr]
     return y, sr, label
+
+
+def estimate_tempo(y, sr):
+    import numpy as np
+    import librosa
+    tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+    return float(np.atleast_1d(tempo)[0])
 
 
 def estimate_key(y, sr):
@@ -913,7 +957,7 @@ def getsongbpm_key(api_key, artist, song):
         return ""
     if not isinstance(res, list):
         return ""
-    hit = next((x for x in res if _norm(x.get("artist", {}).get("name")) == _norm(artist)), None)
+    hit = next((x for x in res if artist_ok(x.get("artist", {}).get("name"), artist)), None)
     return camelot_from_open_key(hit.get("open_key")) if hit else ""
 
 
