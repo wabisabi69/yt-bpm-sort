@@ -559,12 +559,12 @@ def cmd_moods(args):
     rows.sort(key=lambda r: pos.get(r["playlist_item_id"], len(live)))
     desired = {name: [] for name, _, _ in MOODS}
     seen = set()
-    for r in build_target(rows):
-        b, vid = _bpm(r), r.get("video_id")
-        if b is None or not vid or vid in seen or r["title"] in SKIP_TITLES:
+    for r in build_target(rows):  # tracks without a BPM come last, so they end their mood
+        vid, mood = r.get("video_id"), mood_for(r)
+        if not mood or not vid or vid in seen or r["title"] in SKIP_TITLES:
             continue
         seen.add(vid)
-        desired[mood_for(r)].append(vid)
+        desired[mood].append(vid)
 
     store = json.load(open(MOODS_FILE)) if os.path.exists(MOODS_FILE) else {}
     ids = store.setdefault(pid, {})
