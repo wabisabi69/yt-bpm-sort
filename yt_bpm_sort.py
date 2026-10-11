@@ -592,13 +592,10 @@ def cmd_moods(args):
     pos = {item_id: n for n, item_id in enumerate(live)}
     rows.sort(key=lambda r: pos.get(r["playlist_item_id"], len(live)))
     desired = {name: [] for name, _, _ in MOODS}
-    seen = set()
     ordered = build_target(rows)  # tracks without a BPM come last, so they end their mood
-    # A track that follows another goes in the same mood playlist as its anchor,
-    # so the pair stays together (build_target already placed it right after).
-    moods = {}
-    for r in ordered:
-        moods[r["playlist_item_id"]] = mood_for(r)
+    # A track that follows another also joins its anchor's mood playlist, right
+    # after it, while keeping its own measured place in its own mood.
+    moods = {r["playlist_item_id"]: {mood_for(r)} - {None} for r in ordered}
     for _ in range(len(ordered)):  # settle chains (C follows B follows A)
         changed = False
         for r in ordered:
@@ -608,17 +605,40 @@ def cmd_moods(args):
             anchor = next((a for a in ordered if a is not r and want in (
                 a["title"].strip().lower(), a["song_guess"].strip().lower(),
                 a["video_id"].lower(), a["playlist_item_id"].lower())), None)
-            if anchor and moods[r["playlist_item_id"]] != moods[anchor["playlist_item_id"]]:
-                moods[r["playlist_item_id"]] = moods[anchor["playlist_item_id"]]
+            if anchor and not moods[anchor["playlist_item_id"]] <= moods[r["playlist_item_id"]]:
+                moods[r["playlist_item_id"]] |= moods[anchor["playlist_item_id"]]
                 changed = True
         if not changed:
             break
-    for r in ordered:
-        vid, mood = r.get("video_id"), moods[r["playlist_item_id"]]
-        if not mood or not vid or vid in seen or r["title"] in SKIP_TITLES:
-            continue
-        seen.add(vid)
-        desired[mood].append(vid)
+
+    def anchored_by(r):
+        want = (r.get("follows") or "").strip().lower()
+        return next((a for a in ordered if a is not r and want and want in (
+            a["title"].strip().lower(), a["song_guess"].strip().lower(),
+            a["video_id"].lower(), a["playlist_item_id"].lower())), None)
+
+    for name in desired:
+        seen = set()
+        for r in ordered:
+            vid = r.get("video_id")
+            if name not in moods[r["playlist_item_id"]] or not vid or vid in seen \
+                    or r["title"] in SKIP_TITLES:
+                continue
+            seen.add(vid)
+            desired[name].append(vid)
+        # In its own mood a follower sits at its measured tempo, not glued to an
+        # anchor that is not in this playlist; build_target glued it, so unglue.
+        for r in ordered:
+            a = anchored_by(r)
+            vid = r.get("video_id")
+            if a and vid in desired[name] and name not in moods[a["playlist_item_id"]]:
+                desired[name].remove(vid)
+                solo = [x for x in build_target([dict(x, follows="") for x in rows])
+                        if name in moods[x["playlist_item_id"]] and x.get("video_id")]
+                order = [x["video_id"] for x in solo]
+                k = order.index(vid)
+                after = next((order[j] for j in range(k - 1, -1, -1) if order[j] in desired[name]), None)
+                desired[name].insert(desired[name].index(after) + 1 if after else 0, vid)
 
     store = json.load(open(MOODS_FILE)) if os.path.exists(MOODS_FILE) else {}
     ids = store.setdefault(pid, {})
