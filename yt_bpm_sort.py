@@ -213,6 +213,16 @@ def cmd_export(args):
     print(f"\nWrote {args.out}. {missing} of {len(rows)} rows have no BPM.")
     print("Check the bpm column (watch for half/double-time values), then run 'apply'.")
 
+    if kept:
+        current = {r["playlist_item_id"] for r in rows}
+        added = [r for r in rows if r["playlist_item_id"] not in kept]
+        removed = [k for k in kept if k not in current]
+        print(f"Since the last export: {len(added)} added, {len(removed)} removed.")
+        for r in added:
+            print(f"  + {r['title']}")
+        return [r["playlist_item_id"] for r in added], len(removed)
+    return [], 0
+
 
 BAND_WIDTH = 4    # BPM: tracks this close are free to reorder for key and energy
 DUP_GAP = 20      # copies of the same song sit at least this many tracks apart
@@ -662,9 +672,11 @@ def cmd_sync(args):
         sys.exit(f'Create {CONFIG_FILE} with {{"playlist": "<url or id>", "api_key": "<getsongbpm key>"}}')
     cfg = json.load(open(CONFIG_FILE))
     ns = argparse.Namespace
+    added, removed = [], 0
     try:
-        print("== export"); cmd_export(ns(playlist=cfg["playlist"], api_key=cfg.get("api_key"),
-                                          out=args.csv, delay=0.5))
+        print("== export")
+        added, removed = cmd_export(ns(playlist=cfg["playlist"], api_key=cfg.get("api_key"),
+                                       out=args.csv, delay=0.5))
         print("== fill"); cmd_fill(ns(csv=args.csv, delay=0.5))
         print("== analyse"); cmd_analyse(ns(csv=args.csv, api_key=cfg.get("api_key"), delay=0.4))
         print("== apply")
@@ -676,6 +688,27 @@ def cmd_sync(args):
             print("\nDaily quota used up. The next run continues from here.")
             return
         raise
+    finally:
+        report_new_tracks(args.csv, added, removed)
+
+
+def report_new_tracks(csv_path, added_ids, removed):
+    """Say where each newly added track ended up, and flag any that need a hand."""
+    print(f"\n== new tracks: {len(added_ids)} added, {removed} removed since the last run")
+    if not added_ids:
+        return
+    with open(csv_path, newline="", encoding="utf-8-sig") as f:
+        rows = {r["playlist_item_id"]: r for r in csv.DictReader(f)}
+    for item_id in added_ids:
+        r = rows.get(item_id)
+        if not r:
+            continue
+        mood = mood_for(r)
+        if _bpm(r) is None and not mood:
+            where = "NEEDS INPUT: no BPM found, sits at the end; give it a BPM or a mood"
+        else:
+            where = f"{r['bpm'] or '?'} BPM, key {r.get('key') or '?'}, {mood or 'no mood'} playlist"
+        print(f"  + {r['title'][:50]:<50} -> {where}")
 
 
 VARIANT = re.compile(
