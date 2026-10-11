@@ -38,7 +38,7 @@ FIELDS = ["playlist_id", "position", "playlist_item_id", "video_id", "title",
           "channel", "artist_guess", "song_guess", "bpm", "bpm_source", "follows",
           "key", "key_source", "energy", "mood"]
 # Columns a re-export carries over from the previous CSV for the same item
-KEPT = ["bpm", "bpm_source", "follows", "key", "key_source", "energy", "mood"]
+KEPT = ["bpm", "bpm_source", "follows", "key", "key_source", "energy", "mood", "artist_guess"]
 SKIP_TITLES = {"Deleted video", "Private video"}
 
 
@@ -90,6 +90,23 @@ NOISE = re.compile(
 )
 FEAT = re.compile(r"\s+(ft\.?|feat\.?|featuring)\s+.*$", re.I)
 SPLIT = re.compile(r"\s+[-\u2013\u2014|]\s+")
+
+
+def topic_artists(yt, video_ids):
+    """Real artist for auto-generated ("- Topic") uploads, read from the
+    'Provided to YouTube by' description line 'Title · Artist · Artist'.
+    Channel names can be placeholders such as 'Release - Topic'."""
+    out = {}
+    ids = [v for v in video_ids if v]
+    for i in range(0, len(ids), 50):
+        resp = yt.videos().list(part="snippet", id=",".join(ids[i:i + 50])).execute()
+        for v in resp.get("items", []):
+            for line in v["snippet"].get("description", "").splitlines():
+                parts = [p.strip() for p in line.split(" · ")]
+                if len(parts) >= 2 and parts[1]:
+                    out[v["id"]] = parts[1]
+                    break
+    return out
 
 
 def guess_artist_song(title, channel):
@@ -171,13 +188,20 @@ def cmd_export(args):
     items = fetch_items(yt, pid)
     print(f"Fetched {len(items)} items")
 
+    new_topic = [it["snippet"]["resourceId"].get("videoId") for it in items
+                 if it["id"] not in kept
+                 and it["snippet"].get("videoOwnerChannelTitle", "").endswith(" - Topic")]
+    credited = topic_artists(yt, new_topic) if new_topic else {}
+
     rows = []
     for it in items:
         sn = it["snippet"]
         title = sn["title"]
         channel = sn.get("videoOwnerChannelTitle", "")
         artist, song = guess_artist_song(title, channel)
+        artist = credited.get(sn["resourceId"].get("videoId"), artist)
         old = kept.get(it["id"], {})
+        artist = old.get("artist_guess") or artist  # keep corrections made in the CSV
         if old.get("bpm"):
             bpm, source = old["bpm"], old["bpm_source"]
         elif api_key and title not in SKIP_TITLES:
