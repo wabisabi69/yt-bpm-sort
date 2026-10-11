@@ -593,8 +593,28 @@ def cmd_moods(args):
     rows.sort(key=lambda r: pos.get(r["playlist_item_id"], len(live)))
     desired = {name: [] for name, _, _ in MOODS}
     seen = set()
-    for r in build_target(rows):  # tracks without a BPM come last, so they end their mood
-        vid, mood = r.get("video_id"), mood_for(r)
+    ordered = build_target(rows)  # tracks without a BPM come last, so they end their mood
+    # A track that follows another goes in the same mood playlist as its anchor,
+    # so the pair stays together (build_target already placed it right after).
+    moods = {}
+    for r in ordered:
+        moods[r["playlist_item_id"]] = mood_for(r)
+    for _ in range(len(ordered)):  # settle chains (C follows B follows A)
+        changed = False
+        for r in ordered:
+            want = (r.get("follows") or "").strip().lower()
+            if not want:
+                continue
+            anchor = next((a for a in ordered if a is not r and want in (
+                a["title"].strip().lower(), a["song_guess"].strip().lower(),
+                a["video_id"].lower(), a["playlist_item_id"].lower())), None)
+            if anchor and moods[r["playlist_item_id"]] != moods[anchor["playlist_item_id"]]:
+                moods[r["playlist_item_id"]] = moods[anchor["playlist_item_id"]]
+                changed = True
+        if not changed:
+            break
+    for r in ordered:
+        vid, mood = r.get("video_id"), moods[r["playlist_item_id"]]
         if not mood or not vid or vid in seen or r["title"] in SKIP_TITLES:
             continue
         seen.add(vid)
