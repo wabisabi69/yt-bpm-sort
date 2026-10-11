@@ -601,33 +601,40 @@ def _sync_mood(yt, mpid, name, want):
         except HttpError as e:
             if e.resp.status != 404 or wait == 60:
                 raise
-    have, extra = {}, []
-    for i in items:
-        vid = i["snippet"]["resourceId"].get("videoId")
-        if vid in want and vid not in have:
-            have[vid] = i
-        else:
-            extra.append(i)
-    for i in extra:
-        _run(yt.playlistItems().delete(id=i["id"]))
-    missing = [v for v in want if v not in have]
-    print(f"{name}: {len(want)} tracks, {len(have)} present, adding {len(missing)}, "
-          f"removing {len(extra)}", flush=True)
-    for n, vid in enumerate(missing, 1):
-        try:
-            _run(yt.playlistItems().insert(part="snippet", body={"snippet": {
-                "playlistId": mpid, "resourceId": {"kind": "youtube#video", "videoId": vid}}}))
-        except HttpError as e:
-            if _is_quota(e):
-                raise
-            print(f"  could not add {vid}: {e.resp.status}")
-        if n % 25 == 0:
-            print(f"  {name}: added {n}/{len(missing)}", flush=True)
-    if not missing and not extra:
+
+    # YouTube sometimes accepts a delete without doing it, and a retried insert
+    # can land twice, so re-read and repeat until the contents match.
+    unaddable = set()
+    for rnd in range(4):
+        have, extra = {}, []
+        for i in items:
+            vid = i["snippet"]["resourceId"].get("videoId")
+            if vid in want and vid not in have:
+                have[vid] = i
+            else:
+                extra.append(i)
+        missing = [v for v in want if v not in have and v not in unaddable]
+        if not extra and not missing:
+            break
+        print(f"{name}: {len(want)} tracks, {len(have)} present, adding {len(missing)}, "
+              f"removing {len(extra)}" + (f" (check {rnd + 1})" if rnd else ""), flush=True)
+        for i in extra:
+            _run(yt.playlistItems().delete(id=i["id"]))
+        for n, vid in enumerate(missing, 1):
+            try:
+                _run(yt.playlistItems().insert(part="snippet", body={"snippet": {
+                    "playlistId": mpid, "resourceId": {"kind": "youtube#video", "videoId": vid}}}))
+            except HttpError as e:
+                if _is_quota(e):
+                    raise
+                unaddable.add(vid)
+                print(f"  could not add {vid}: {e.resp.status}")
+            if n % 25 == 0:
+                print(f"  {name}: added {n}/{len(missing)}", flush=True)
+        time.sleep(20)
         items = fetch_items(yt, mpid)
     else:
-        time.sleep(15)
-        items = fetch_items(yt, mpid)
+        print(f"  {name}: WARNING contents still differ after 4 checks; the next run retries")
     by_vid = {i["snippet"]["resourceId"].get("videoId"): i for i in items}
     current = [i["id"] for i in items]
     target = [by_vid[v]["id"] for v in want if v in by_vid]
