@@ -136,7 +136,8 @@ def lookup_bpm(api_key, artist, song):
     # Retry with parenthetical or bracketed text stripped, e.g.
     # "Sunflower (Spider-Man: Into the Spider-Verse)" -> "Sunflower"
     bare = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", song).strip()
-    if bare and bare != song:
+    # Never fall back from a remix or mashup to the original: it has another tempo
+    if bare and bare != song and not VARIANT.search(song):
         time.sleep(1)
         return _lookup_once(api_key, artist, bare)
     return bpm, source
@@ -777,7 +778,7 @@ def report_new_tracks(csv_path, added_ids, removed):
 
 VARIANT = re.compile(
     r"sped\s*up|speed\s*up|slowed|reverb|nightcore|remix|\bedit\b|\blive\b|"
-    r"acoustic|instrumental|extended|cover|karaoke|8d",
+    r"acoustic|instrumental|extended|cover|karaoke|8d|\bvs\b\.?|\bflip\b|bootleg|mashup",
     re.I,
 )
 
