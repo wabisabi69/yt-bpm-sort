@@ -49,9 +49,19 @@ def get_youtube():
     if os.path.exists(TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
     if not creds or not creds.valid:
+        refreshed = False
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            from google.auth.exceptions import RefreshError
+            try:
+                creds.refresh(Request())
+                refreshed = True
+            except RefreshError:
+                # Apps left in Testing mode get logins that expire after 7 days.
+                # Never open a browser here: the scheduled run would hang on it.
+                sys.exit("GOOGLE LOGIN EXPIRED: run 'python yt_bpm_sort.py login' to sign in "
+                         "again. To stop this recurring every 7 days, publish the app "
+                         "(Google Auth Platform > Audience > Publish app).")
+        if not refreshed:
             if not os.path.exists(CLIENT_SECRET):
                 sys.exit(f"Missing {CLIENT_SECRET}. Download your OAuth Desktop client JSON from Google Cloud.")
             flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET, SCOPES)
@@ -59,6 +69,15 @@ def get_youtube():
         with open(TOKEN_FILE, "w") as f:
             f.write(creds.to_json())
     return build("youtube", "v3", credentials=creds)
+
+
+def cmd_login(args):
+    """Sign in again in the browser and save a fresh token."""
+    flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET, SCOPES)
+    creds = flow.run_local_server(port=0)
+    with open(TOKEN_FILE, "w") as f:
+        f.write(creds.to_json())
+    print("Signed in. Saved a fresh token.")
 
 
 def parse_playlist_id(s):
@@ -1141,6 +1160,9 @@ def main():
     sy = sub.add_parser("sync", help="export, fill, analyse, apply and moods in one go (uses config.json)")
     sy.add_argument("csv", nargs="?", default="playlist_bpm.csv")
     sy.set_defaults(func=cmd_sync)
+
+    lg = sub.add_parser("login", help="Sign in to Google again (after the login expires)")
+    lg.set_defaults(func=cmd_login)
 
     args = p.parse_args()
     args.func(args)
