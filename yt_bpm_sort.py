@@ -512,7 +512,15 @@ def cmd_apply(args):
         return
 
     done = 0
-    for pos, item_id in moves:
+    if len(moves) > 20:
+        if not _probe_manual(yt, pid, live_by_id, moves[0]):
+            print("\nWARNING: a test move did not stick. Set the playlist's Default ordering to "
+                  "Manual in YouTube, then run again. No further quota was spent.")
+            return "unsorted"
+        done = 1
+        print(f"  [1/{len(moves)}] {moves[0][0]:>4}: {live_by_id[moves[0][1]]['snippet']['title']}"
+              " (test move stuck)")
+    for pos, item_id in moves[done:]:
         it = live_by_id[item_id]
         body = {
             "id": item_id,
@@ -548,6 +556,22 @@ def cmd_apply(args):
         return "unsorted"
     print("\nDone. Playlist is sorted.")
     return "done"
+
+
+def _probe_manual(yt, pid, live_by_id, move):
+    """Make the first move and confirm it stuck before spending quota on a big
+    reorder. YouTube accepts moves on playlists that are not set to Manual
+    ordering and then ignores them; listings can also lag, so poll briefly."""
+    pos, item_id = move
+    it = live_by_id[item_id]
+    _run(yt.playlistItems().update(part="snippet", body={"id": item_id, "snippet": {
+        "playlistId": pid, "resourceId": it["snippet"]["resourceId"], "position": pos}}))
+    for wait in (5, 15, 30, 60):
+        time.sleep(wait)
+        ids = [i["id"] for i in fetch_items(yt, pid)]
+        if item_id in ids and ids.index(item_id) == pos:
+            return True
+    return False
 
 
 def _is_quota(e):
