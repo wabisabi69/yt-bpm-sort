@@ -89,9 +89,17 @@ def parse_playlist_id(s):
 def fetch_items(yt, playlist_id):
     items, token = [], None
     while True:
-        resp = yt.playlistItems().list(
-            part="snippet", playlistId=playlist_id, maxResults=50, pageToken=token
-        ).execute()
+        req = yt.playlistItems().list(
+            part="snippet", playlistId=playlist_id, maxResults=50, pageToken=token)
+        for wait in (5, 15, 30, None):
+            try:
+                resp = req.execute()
+                break
+            except HttpError as e:
+                # YouTube occasionally answers 404 or 5xx for an existing playlist
+                if wait is None or e.resp.status not in (404, 409, 500, 502, 503, 504):
+                    raise
+                time.sleep(wait)
         items.extend(resp["items"])
         token = resp.get("nextPageToken")
         if not token:
