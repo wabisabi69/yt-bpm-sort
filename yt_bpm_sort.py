@@ -384,7 +384,22 @@ def arc_order(ordered):
 def build_target(rows, descending=False, arc=False):
     """Final order: felt BPM ascending, refined within small tempo bands for
     key and energy, duplicates spread out, then follows rules applied.
-    Rows should arrive in current playlist order (ties keep that order)."""
+    Rows should arrive in current playlist order (ties keep that order).
+
+    Bands lean towards the current order, so sorting an already sorted list
+    can still shuffle it a little, and a big change would then cost moves on
+    the following runs too. Re-sort until the order stops changing, so one
+    apply reaches the order later runs agree with."""
+    ordered = _build_once(rows, descending, arc)
+    for _ in range(10):
+        again = _build_once(ordered, descending, arc)
+        if all(a is b for a, b in zip(again, ordered)):
+            break
+        ordered = again
+    return ordered
+
+
+def _build_once(rows, descending, arc):
     for n, r in enumerate(rows):
         r["_live"] = n
     timed = sorted((r for r in rows if _bpm(r) is not None), key=_bpm)
