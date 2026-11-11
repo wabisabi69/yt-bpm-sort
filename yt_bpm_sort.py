@@ -80,6 +80,88 @@ def cmd_login(args):
     print("Signed in. Saved a fresh token.")
 
 
+YTM_AUTH = "browser.json"
+
+
+def get_ytmusic():
+    """YouTube Music's web API, used for playlist writes when browser.json exists:
+    it is not billed against the Data API's daily quota."""
+    if not os.path.exists(YTM_AUTH):
+        return None
+    from ytmusicapi import YTMusic
+    try:
+        ytm = YTMusic(YTM_AUTH)
+        ytm.get_library_playlists(limit=1)  # fails fast once the browser session is signed out
+        return ytm
+    except Exception as e:
+        print(f"YouTube Music login in {YTM_AUTH} no longer works ({e}); using the quota-billed API.")
+        return None
+
+
+def _ytm_set_ids(ytm, pid, items):
+    """Map Data API playlist item ids to YouTube Music setVideoIds, pairing the
+    k-th copy of each video in both listings (YT Music can hide unavailable videos)."""
+    tracks = ytm.get_playlist(pid, limit=None)["tracks"]
+    if len(tracks) == len(items):
+        # Same playlist order in both listings, but YT Music shows some videos under their
+        # audio-only twin's id, so pair by position once most ids agree.
+        same = sum(t.get("videoId") == i["snippet"]["resourceId"].get("videoId")
+                   for t, i in zip(tracks, items))
+        if len(items) - same <= max(1, len(items) // 10):
+            return {i["id"]: t["setVideoId"] for t, i in zip(tracks, items) if t.get("setVideoId")}
+    by_vid = {}
+    for t in tracks:
+        if t.get("setVideoId"):
+            by_vid.setdefault(t.get("videoId"), []).append(t["setVideoId"])
+    out = {}
+    for i in items:
+        q = by_vid.get(i["snippet"]["resourceId"].get("videoId"))
+        if q:
+            out[i["id"]] = q.pop(0)
+    return out
+
+
+def _ytm_moves(ytm, pid, items, moves):
+    """Apply plan_moves output through YouTube Music. It moves an item before a
+    successor rather than to a position, so replay the moves to find each successor."""
+    sids = _ytm_set_ids(ytm, pid, items)
+    title = {i["id"]: i["snippet"]["title"] for i in items}
+    cur = [i["id"] for i in items]
+    fails = 0
+    for n, (pos, item_id) in enumerate(moves, 1):
+        cur.remove(item_id)
+        cur.insert(pos, item_id)
+        if item_id not in sids:
+            print(f"  skipped {title[item_id]}: not listed in YouTube Music")
+            continue
+        succ = next((sids[x] for x in cur[pos + 1:] if x in sids), None)
+        for wait in (2, 10, None):  # back off on rate limits before giving up on this move
+            try:
+                ytm.edit_playlist(pid, moveItem=(sids[item_id], succ) if succ else sids[item_id])
+                fails = 0
+                break
+            except Exception as e:
+                if wait:
+                    time.sleep(wait)
+                    continue
+                fails += 1
+                if fails >= 5:  # login expired or the endpoint changed: stop, don't spam
+                    raise
+                print(f"  skipped {title[item_id]}: {e}")
+        else:
+            continue  # gave up on this move
+        time.sleep(0.2)
+        print(f"  [{n}/{len(moves)}] {pos:>4}: {title[item_id]}", flush=True)
+
+
+def _ytm_add(ytm, pid, vids):
+    try:
+        r = ytm.add_playlist_items(pid, vids, duplicates=True)
+        return isinstance(r, dict) and r.get("status") == "STATUS_SUCCEEDED"
+    except Exception:
+        return False
+
+
 def parse_playlist_id(s):
     if "list=" in s:
         return parse_qs(urlparse(s).query)["list"][0]
@@ -535,6 +617,11 @@ def cmd_apply(args):
         return
 
     done = 0
+    ytm = get_ytmusic()
+    if ytm:
+        print("Moving through YouTube Music (no quota).")
+        _ytm_moves(ytm, pid, live, moves)
+        moves = []  # all made; skip the quota-billed path and go straight to the check
     if len(moves) > 20:
         if not _probe_manual(yt, pid, live_by_id, moves[0]):
             print("\nWARNING: a test move did not stick. Set the playlist's Default ordering to "
@@ -710,6 +797,7 @@ def cmd_moods(args):
     store = json.load(open(MOODS_FILE)) if os.path.exists(MOODS_FILE) else {}
     ids = store.setdefault(pid, {})
     main_title = yt.playlists().list(part="snippet", id=pid).execute()["items"][0]["snippet"]["title"]
+    ytm = get_ytmusic()
 
     try:
         for name, lo, hi in MOODS:
@@ -722,7 +810,7 @@ def cmd_moods(args):
                 ids[name] = _run(yt.playlists().insert(part="snippet,status", body=body))["id"]
                 json.dump(store, open(MOODS_FILE, "w"), indent=1)
                 print(f"Created playlist '{body['snippet']['title']}'")
-            _sync_mood(yt, ids[name], name, desired[name])
+            _sync_mood(yt, ids[name], name, desired[name], ytm)
     except HttpError as e:
         if _is_quota(e):
             print("\nHit the daily quota while building mood playlists. "
@@ -732,7 +820,7 @@ def cmd_moods(args):
     return "done"
 
 
-def _sync_mood(yt, mpid, name, want):
+def _sync_mood(yt, mpid, name, want, ytm=None):
     # A just-created playlist can 404 for a short while before it is listable
     for wait in (0, 5, 15, 30, 60):
         time.sleep(wait)
@@ -759,19 +847,37 @@ def _sync_mood(yt, mpid, name, want):
             break
         print(f"{name}: {len(want)} tracks, {len(have)} present, adding {len(missing)}, "
               f"removing {len(extra)}" + (f" (check {rnd + 1})" if rnd else ""), flush=True)
-        for i in extra:
-            _run(yt.playlistItems().delete(id=i["id"]))
-        for n, vid in enumerate(missing, 1):
-            try:
-                _run(yt.playlistItems().insert(part="snippet", body={"snippet": {
-                    "playlistId": mpid, "resourceId": {"kind": "youtube#video", "videoId": vid}}}))
-            except HttpError as e:
-                if _is_quota(e):
-                    raise
-                unaddable.add(vid)
-                print(f"  could not add {vid}: {e.resp.status}")
-            if n % 25 == 0:
-                print(f"  {name}: added {n}/{len(missing)}", flush=True)
+        if ytm:  # no quota
+            sids = _ytm_set_ids(ytm, mpid, items)
+            gone = [{"videoId": i["snippet"]["resourceId"].get("videoId"), "setVideoId": sids[i["id"]]}
+                    for i in extra if i["id"] in sids]
+            if gone:
+                ytm.remove_playlist_items(mpid, gone)
+            failed = 0
+            for k in range(0, len(missing), 50):
+                chunk = missing[k:k + 50]
+                if _ytm_add(ytm, mpid, chunk):
+                    continue
+                for vid in chunk:  # one bad video fails its whole batch, so retry singly
+                    if not _ytm_add(ytm, mpid, [vid]):
+                        unaddable.add(vid)
+                        failed += 1
+                        print(f"  could not add {vid}")
+            print(f"  {name}: added {len(missing) - failed}", flush=True)
+        else:
+            for i in extra:
+                _run(yt.playlistItems().delete(id=i["id"]))
+            for n, vid in enumerate(missing, 1):
+                try:
+                    _run(yt.playlistItems().insert(part="snippet", body={"snippet": {
+                        "playlistId": mpid, "resourceId": {"kind": "youtube#video", "videoId": vid}}}))
+                except HttpError as e:
+                    if _is_quota(e):
+                        raise
+                    unaddable.add(vid)
+                    print(f"  could not add {vid}: {e.resp.status}")
+                if n % 25 == 0:
+                    print(f"  {name}: added {n}/{len(missing)}", flush=True)
         time.sleep(20)
         items = fetch_items(yt, mpid)
     else:
@@ -781,7 +887,9 @@ def _sync_mood(yt, mpid, name, want):
     target = [by_vid[v]["id"] for v in want if v in by_vid]
     target += [i for i in current if i not in set(target)]
     moves = plan_moves(current, target)
-    for pos, item_id in moves:
+    if ytm:
+        _ytm_moves(ytm, mpid, items, moves)
+    for pos, item_id in ([] if ytm else moves):
         it = next(i for i in items if i["id"] == item_id)
         _run(yt.playlistItems().update(part="snippet", body={"id": item_id, "snippet": {
             "playlistId": mpid, "resourceId": it["snippet"]["resourceId"], "position": pos}}))
@@ -873,24 +981,24 @@ def title_ok(found, wanted):
     import difflib
 
     def base(s):
-        s = re.sub(r"[\(\[（【][^\)\]）】]*[\)\]）】]", "", s or "")
-        return re.sub(r"[\W_]+", "", s.lower())
+        t = re.sub(r"[\W_]+", "", re.sub(r"[\(\[（【][^\)\]）】]*[\)\]）】]", "", s or "").lower())
+        return t or re.sub(r"[\W_]+", "", (s or "").lower())  # all-bracket titles like '[oops]'
     a, b = base(found), base(wanted)
     if not a or not b:
         return False
     return a in b or b in a or difflib.SequenceMatcher(None, a, b).ratio() >= 0.8
 
 
-def _match_score(track, artist, song):
+def _match_score(track, artist, song, tags=None):
     """Rank a Deezer result: right artist, exact title, and no version tag
-    (sped up, slowed, remix...) that the YouTube title does not also have."""
+    (sped up, slowed, remix...) that the YouTube title (`tags`, default the song) does not also have."""
     title = track.get("title", "")
     score = 0
     if artist and artist_ok(track["artist"]["name"], artist):
         score += 4
     if _norm(title) == _norm(song):
         score += 2
-    wanted = {m.lower() for m in VARIANT.findall(song)}
+    wanted = {m.lower() for m in VARIANT.findall(tags or song)}
     got = {m.lower() for m in VARIANT.findall(title)}
     score -= 3 * len(got - wanted)
     return score
@@ -898,26 +1006,79 @@ def _match_score(track, artist, song):
 
 def deezer_find_preview(artist, song):
     """Return (preview_url, 'Title / Artist') for the best Deezer match, or (None, why)."""
-    q = f"{song} {artist}".strip()
-    try:
-        r = requests.get("https://api.deezer.com/search",
-                         params={"q": q, "limit": 5}, timeout=15)
-        r.raise_for_status()
-        data = r.json().get("data") or []
-    except (requests.RequestException, ValueError) as e:
-        return None, f"deezer error: {e}"
-    if not data:
-        return None, "deezer: no result"
-    hit = max(data, key=lambda t: _match_score(t, artist, song))
-    if _match_score(hit, artist, song) < 0:
-        return None, f"deezer: only other versions found, e.g. '{hit['title']}'"
-    if artist and not artist_ok(hit["artist"]["name"], artist):
-        return None, f"deezer: only other artists, e.g. '{hit['title']} / {hit['artist']['name']}'"
-    if not title_ok(hit["title"], song):
-        return None, f"deezer: only other songs, e.g. '{hit['title']} / {hit['artist']['name']}'"
+    hit, why = _deezer_hit(artist, song)
+    if not hit:
+        return None, why
     if not hit.get("preview"):
         return None, "deezer: match has no preview"
-    return hit["preview"], f"{hit['title']} / {hit['artist']['name']}"
+    return hit["preview"], why
+
+
+def deezer_bpm(artist, song):
+    """Deezer's own tempo for the best match: (bpm, label), or (None, why). Deezer reports
+    0 for tracks it has not measured."""
+    hit, why = _deezer_hit(artist, song)
+    if not hit:
+        return None, why
+    try:
+        bpm = float(requests.get(f"https://api.deezer.com/track/{hit['id']}", timeout=15).json().get("bpm") or 0)
+    except (requests.RequestException, ValueError) as e:
+        return None, f"deezer error: {e}"
+    return (bpm if bpm > 0 else None), why
+
+
+_BRACKETED = r"[\(\[（【]([^\)\]）】]*)[\)\]）】]"
+
+
+def _search_variants(artist, song, cap=8):
+    """(artist, song) pairs to search, most literal first: as given, bracketed extras dropped,
+    first credited artist only, each side of a '〜', then bracketed aliases ('BTS (방탄소년단)')."""
+    def strip(s):
+        return re.sub(r"\s+", " ", re.sub(_BRACKETED, " ", s or "")).strip()
+    first = re.split(r",|&|\s+x\s+|\bfeat\.?|\bft\.?|\bwith\b", artist or "", flags=re.I)[0].strip()
+    a0, s0, a1, s1, a2 = artist or "", song or "", strip(artist), strip(song), strip(first)
+    pairs = [(a0, s0), (a1, s1), (a2, s1)]
+    pairs += [(a2, p.strip()) for p in re.split(r"[〜~]", s1)]
+    pairs += [(alias.strip(), s1) for alias in re.findall(_BRACKETED, first)]
+    pairs += [(a2, alias.strip()) for alias in re.findall(_BRACKETED, s0)]
+    out = []
+    for p in pairs:
+        if p[1] and p not in out:
+            out.append(p)
+    return out[:cap]
+
+
+def _has_latin(s):
+    return bool(re.search(r"[A-Za-z]", s or ""))
+
+
+def _deezer_hit(artist, song):
+    """Return (track, 'Title / Artist') for the best Deezer match over several search
+    wordings, or (None, why) giving the reason from the most literal search."""
+    first_why = None
+    for a, s in _search_variants(artist, song):
+        try:
+            r = requests.get("https://api.deezer.com/search",
+                             params={"q": f"{s} {a}".strip(), "limit": 5}, timeout=15)
+            r.raise_for_status()
+            data = r.json().get("data") or []
+        except (requests.RequestException, ValueError) as e:
+            return None, f"deezer error: {e}"
+        hit = max(data, key=lambda t: _match_score(t, a, s, song)) if data else None
+        if not hit:
+            why = "deezer: no result"
+        elif _match_score(hit, a, s, song) < 0:
+            why = f"deezer: only other versions found, e.g. '{hit['title']}'"
+        elif a and not artist_ok(hit["artist"]["name"], a):
+            why = f"deezer: only other artists, e.g. '{hit['title']} / {hit['artist']['name']}'"
+        elif title_ok(hit["title"], s) or (a and not _has_latin(s) and hit is data[0]):
+            # Deezer files many K-pop/J-pop songs under an English title ('쩔어' is 'Dope');
+            # for a non-Latin title, trust the top hit once the artist matches.
+            return hit, f"{hit['title']} / {hit['artist']['name']}"
+        else:
+            why = f"deezer: only other songs, e.g. '{hit['title']} / {hit['artist']['name']}'"
+        first_why = first_why or why
+    return None, first_why or "deezer: no result"
 
 
 def estimate_bpm_from_url(url):
@@ -968,9 +1129,11 @@ def fold_bpm(bpm, lo=70, hi=FELT_MAX):
 def cmd_fill(args):
     with open(args.csv, newline="", encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
-    blanks = [r for r in rows if not (r.get("bpm") or "").strip()
-              and r["title"] not in SKIP_TITLES]
-    print(f"{len(blanks)} rows without BPM. Trying Deezer previews...", flush=True)
+    # Blank rows, plus rows estimated from audio: Deezer's measured tempo beats both
+    blanks = [r for r in rows if r["title"] not in SKIP_TITLES and (
+        not (r.get("bpm") or "").strip() or (r.get("bpm_source", "").startswith("deezer_preview:librosa")
+                                             and not getattr(args, "blanks_only", False)))]
+    print(f"{len(blanks)} rows without a measured BPM. Trying Deezer, then previews...", flush=True)
 
     def save():
         with open(args.csv, "w", newline="", encoding="utf-8-sig") as f:
@@ -981,23 +1144,38 @@ def cmd_fill(args):
     filled = 0
     for n, r in enumerate(blanks, 1):
         label = f"[{n}/{len(blanks)}] {r['artist_guess']} - {r['song_guess']}"
-        try:
-            samples, sr, matched = load_preview(r["artist_guess"], r["song_guess"])
-            raw = estimate_tempo(samples, sr) if samples is not None else None
-        except Exception as e:
-            samples, matched, raw = None, f"analysis failed: {e}", None
-        if samples is None:
-            print(f"  skip  {label}  ({matched})", flush=True)
+        dz, matched = deezer_bpm(r["artist_guess"], r["song_guess"])
+        if dz:
+            bpm, was_folded = fold_bpm(dz)
+            note = f" (raw {dz:.1f})" if was_folded else ""
+            r["bpm"], r["bpm_source"] = str(bpm), f"deezer_bpm: {matched}{note}"
+            filled += 1
+            print(f"  {bpm:>6}  {label}  <- deezer {matched}{note}", flush=True)
+            if filled % 20 == 0:
+                save()
             time.sleep(args.delay)
             continue
+        if (r.get("bpm") or "").strip():
+            continue  # already estimated from audio; keep it
+        try:
+            raw, matched = preview_tempo(r["artist_guess"], r["song_guess"])
+        except Exception as e:
+            raw, matched = None, f"analysis failed: {e}"
+        source = "deezer_preview:librosa"
+        if raw is None and r.get("video_id"):
+            try:
+                raw, why = youtube_tempo(r["video_id"])
+            except Exception as e:  # unreadable download: skip this row, keep filling
+                raw, why = None, f"youtube: {e}"
+            matched, source = (why, "youtube_audio:librosa") if raw else (f"{matched}; {why}", source)
         bpm, was_folded = fold_bpm(raw)
         if bpm is None:
-            print(f"  skip  {label}  (no beat detected)", flush=True)
+            print(f"  skip  {label}  ({matched})", flush=True)
             time.sleep(args.delay)
             continue
         note = f" (raw {raw:.1f})" if was_folded else ""
         r["bpm"] = str(bpm)
-        r["bpm_source"] = f"deezer_preview:librosa: {matched}{note}"
+        r["bpm_source"] = f"{source}: {matched}{note}"
         filled += 1
         print(f"  {bpm:>6}  {label}  <- {matched}{note}", flush=True)
         if filled % 20 == 0:
@@ -1056,15 +1234,87 @@ def itunes_find_preview(artist, song):
 
 def load_preview(artist, song):
     """Return (samples, sample_rate, label) for the middle of a 30s preview, or (None, None, why)."""
-    import tempfile
-    import subprocess
-    import soundfile as sf
-
     url, label = deezer_find_preview(artist, song)
     if not url and _ffmpeg():
         url, label = itunes_find_preview(artist, song)
     if not url:
         return None, None, label
+    y, sr = _download_preview(url)
+    if len(y) > 20 * sr:
+        y = y[5 * sr:-5 * sr]
+    return y, sr, label
+
+
+def preview_tempo(artist, song):
+    """Tempo from several windows of the Deezer preview, then of the iTunes one (often a
+    different part of the song). Returns (raw_bpm, label) or (None, why)."""
+    whys = []
+    for find in (deezer_find_preview, itunes_find_preview):
+        if find is itunes_find_preview and not _ffmpeg():
+            break
+        url, label = find(artist, song)
+        if not url:
+            whys.append(label)
+            continue
+        try:
+            tempos = _window_tempos(*_download_preview(url))
+        except Exception as e:
+            whys.append(f"{label}: {e}")
+            continue
+        if tempos:
+            return _median_felt(tempos), f"{label}, {len(tempos)}/4 windows"
+        whys.append(f"{label}: no beat in any window")
+    return None, "; ".join(whys)
+
+
+def _median_felt(tempos):
+    """Median by felt tempo, so 83 and 166 readings of one song count as agreeing."""
+    return sorted(tempos, key=lambda t: fold_bpm(t)[0])[len(tempos) // 2]
+
+
+def youtube_tempo(video_id):
+    """Last resort: the video's own audio, exactly the version in the playlist. Tempo from
+    20s windows at 20/40/60/80% through it. Returns (raw_bpm, label) or (None, why)."""
+    import shutil
+    import subprocess
+    import tempfile
+    import soundfile as sf
+    if not _ffmpeg():
+        return None, "youtube: needs ffmpeg"
+    d = tempfile.mkdtemp()
+    try:
+        subprocess.run([sys.executable, "-m", "yt_dlp", "-q", "--no-warnings", "--no-playlist",
+                        "-f", "bestaudio", "-o", os.path.join(d, "a.%(ext)s"),
+                        f"https://www.youtube.com/watch?v={video_id}"], check=True, timeout=300)
+        src = os.path.join(d, os.listdir(d)[0])
+        wav = os.path.join(d, "a.wav")
+        subprocess.run([_ffmpeg(), "-y", "-loglevel", "error", "-i", src, "-ac", "1", "-ar", "22050", wav],
+                       check=True, timeout=300)
+        y, sr = sf.read(wav, dtype="float32")
+    except (subprocess.SubprocessError, OSError, IndexError) as e:
+        return None, f"youtube: {e}"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    w = 20 * sr
+    starts = [int(len(y) * f) for f in (0.2, 0.4, 0.6, 0.8)]
+    tempos = [t for s in starts if s + w <= len(y) for t in [estimate_tempo(y[s:s + w], sr)] if t > 0]
+    if not tempos:
+        return None, "youtube: no beat in any window"
+    return _median_felt(tempos), f"youtube audio, {len(tempos)}/4 windows"
+
+
+def _window_tempos(y, sr):
+    """librosa tempo for the middle, whole, start and end of a preview; beatless windows dropped."""
+    n, w = len(y), 12 * sr
+    windows = [y[5 * sr:-5 * sr] if n > 20 * sr else y, y, y[:w], y[-w:]]
+    return [t for s in windows if len(s) >= 6 * sr for t in [estimate_tempo(s, sr)] if t > 0]
+
+
+def _download_preview(url):
+    """Download a preview and return (mono samples, sample_rate), untrimmed."""
+    import tempfile
+    import subprocess
+    import soundfile as sf
     d = tempfile.mkdtemp()
     src = os.path.join(d, "p.mp3" if "dzcdn" in url else "p.m4a")
     wav = os.path.join(d, "p.wav")
@@ -1080,10 +1330,7 @@ def load_preview(artist, song):
             if os.path.exists(p):
                 os.unlink(p)
         os.rmdir(d)
-    y = y.mean(axis=1)
-    if len(y) > 20 * sr:
-        y = y[5 * sr:-5 * sr]
-    return y, sr, label
+    return y.mean(axis=1), sr
 
 
 def estimate_tempo(y, sr):
@@ -1132,6 +1379,22 @@ def getsongbpm_key(api_key, artist, song):
     return camelot_from_open_key(hit.get("open_key")) if hit else ""
 
 
+UNFOLD_ENERGY = 0.5  # a halved track at least this energetic is heard fast, so undo the halving
+
+
+def unfold_if_energetic(r):
+    """fill halves tempos of FELT_MAX and up; energy says whether the track is really heard
+    that fast. Doubles back one step, marked 'kept fast' so mood_for keeps it in Hype."""
+    m = re.search(r"\(raw ([\d.]+)\)", r.get("bpm_source", ""))
+    b = _bpm(r)
+    if not m or b is None or not r.get("energy") or "kept fast" in r["bpm_source"] \
+            or float(m.group(1)) <= b or _energy(r) < UNFOLD_ENERGY:
+        return False
+    r["bpm"] = str(round(b * 2, 1))
+    r["bpm_source"] += f" kept fast (energy {r['energy']})"
+    return True
+
+
 def cmd_analyse(args):
     with open(args.csv, newline="", encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
@@ -1167,8 +1430,11 @@ def cmd_analyse(args):
         if n % 20 == 0:
             save()
         time.sleep(args.delay)
+    fast = [r for r in rows if unfold_if_energetic(r)]
+    for r in fast:
+        print(f"  kept fast {r['bpm']:>6}  {r['title'][:45]}  (energy {r['energy']})")
     save()
-    print("Analysis saved.")
+    print(f"Analysis saved. {len(fast)} halved tempos kept fast for high energy.")
 
 
 def main():
@@ -1185,6 +1451,8 @@ def main():
     fl = sub.add_parser("fill", help="Fill blank BPMs by analysing Deezer 30s previews locally")
     fl.add_argument("csv", nargs="?", default="playlist_bpm.csv")
     fl.add_argument("--delay", type=float, default=0.5, help="Seconds between Deezer lookups")
+    fl.add_argument("--blanks-only", action="store_true",
+                    help="Only rows with no BPM; skip re-checking audio estimates against Deezer")
     fl.set_defaults(func=cmd_fill)
 
     a = sub.add_parser("apply", help="Reorder the playlist using the CSV")
