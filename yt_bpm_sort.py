@@ -1374,10 +1374,11 @@ def estimate_energy(y, sr):
     """Loudness, beat density and attack strength, as one score around 0."""
     import numpy as np
     import librosa
+    env = librosa.onset.onset_strength(y=y, sr=sr)  # computed once: onset_detect would redo it
     feats = {
         "rms": float(np.sqrt(np.mean(y ** 2))),
-        "onsets": len(librosa.onset.onset_detect(y=y, sr=sr)) / (len(y) / sr),
-        "flux": float(np.mean(librosa.onset.onset_strength(y=y, sr=sr))),
+        "onsets": len(librosa.onset.onset_detect(onset_envelope=env, sr=sr)) / (len(y) / sr),
+        "flux": float(np.mean(env)),
     }
     z = [(feats[k] - m) / s for k, (m, s) in ENERGY_REF.items()]
     return round(sum(z) / len(z), 2)
@@ -1426,7 +1427,7 @@ FULL_TRACK = "youtube: full track"
 AUDIO_TEMPO = ("deezer_preview:librosa", "youtube_audio:librosa")  # tempos estimated from audio
 
 
-def full_track(video_id, win=15):
+def full_track(video_id, win=15, tempo=True):
     """Energy and tempo from the video's whole audio, so a slow intro, breakdown or outro
     does not make a hype song read as calm. Energy is the 75th percentile over back-to-back
     windows (the loud sections define the song); tempo comes from the 4 most energetic windows.
@@ -1437,7 +1438,8 @@ def full_track(video_id, win=15):
     wins = [y[s:s + w] for s in range(0, len(y) - w + 1, w)] or [y]
     energies = [estimate_energy(x, sr) for x in wins]
     main = [wins[i] for i in sorted(range(len(wins)), key=lambda i: -energies[i])[:4]]
-    tempos = [t for x in main for t in [estimate_tempo(x, sr)] if t > 0]
+    # tempo=False when a database tempo is kept anyway: beat tracking is the slow part
+    tempos = [t for x in main for t in [estimate_tempo(x, sr)] if t > 0] if tempo else []
     return (round(float(np.percentile(energies, 75)), 2), _median_felt(tempos) if tempos else None,
             _spread(tempos) if tempos else "", np.concatenate(main))
 
@@ -1470,7 +1472,7 @@ def cmd_analyse(args):
         whole, note = None, ""
         if r.get("video_id") and _ffmpeg():
             try:
-                whole = full_track(r["video_id"])
+                whole = full_track(r["video_id"], tempo=r["bpm_source"].startswith(AUDIO_TEMPO))
                 fails = 0
             except Exception as e:
                 fails += 1
