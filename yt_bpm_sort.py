@@ -16,6 +16,7 @@ Usage:
 """
 import argparse
 import csv
+import functools
 import os
 import re
 import sys
@@ -36,9 +37,10 @@ GETSONGBPM_URL = "https://api.getsong.co/search/"
 UPDATE_COST = 50  # quota units per playlistItems.update
 FIELDS = ["playlist_id", "position", "playlist_item_id", "video_id", "title",
           "channel", "artist_guess", "song_guess", "bpm", "bpm_source", "follows",
-          "key", "key_source", "energy", "mood"]
+          "key", "key_source", "energy", "mood", "energy_source"]
 # Columns a re-export carries over from the previous CSV for the same item
-KEPT = ["bpm", "bpm_source", "follows", "key", "key_source", "energy", "mood", "artist_guess"]
+KEPT = ["bpm", "bpm_source", "follows", "key", "key_source", "energy", "mood", "artist_guess",
+        "energy_source"]
 SKIP_TITLES = {"Deleted video", "Private video"}
 
 
@@ -123,16 +125,18 @@ def _ytm_set_ids(ytm, pid, items):
 
 def _ytm_moves(ytm, pid, items, moves):
     """Apply plan_moves output through YouTube Music. It moves an item before a
-    successor rather than to a position, so replay the moves to find each successor."""
+    successor rather than to a position, so replay the moves to find each successor.
+    Returns how many moves could not be made."""
     sids = _ytm_set_ids(ytm, pid, items)
     title = {i["id"]: i["snippet"]["title"] for i in items}
     cur = [i["id"] for i in items]
-    fails = 0
+    fails = skipped = 0
     for n, (pos, item_id) in enumerate(moves, 1):
         cur.remove(item_id)
         cur.insert(pos, item_id)
         if item_id not in sids:
             print(f"  skipped {title[item_id]}: not listed in YouTube Music")
+            skipped += 1
             continue
         succ = next((sids[x] for x in cur[pos + 1:] if x in sids), None)
         for wait in (2, 10, None):  # back off on rate limits before giving up on this move
@@ -149,9 +153,11 @@ def _ytm_moves(ytm, pid, items, moves):
                     raise
                 print(f"  skipped {title[item_id]}: {e}")
         else:
-            continue  # gave up on this move
+            skipped += 1  # gave up on this move
+            continue
         time.sleep(0.2)
         print(f"  [{n}/{len(moves)}] {pos:>4}: {title[item_id]}", flush=True)
+    return skipped
 
 
 def _ytm_add(ytm, pid, vids):
@@ -272,10 +278,16 @@ def _lookup_once(api_key, artist, song):
     else:
         best = results[0]
     tempo = best.get("tempo")
-    if not tempo:
+    try:
+        # Double half-time readings ('Lean On' comes back as 49) like the other sources do.
+        # Fast ones stay: the energy rule in mood_for already sends calm ones to Mid.
+        bpm, was_folded = fold_bpm(float(tempo or 0), hi=float("inf"))
+    except (TypeError, ValueError):
+        bpm = None
+    if bpm is None:
         return "", "match had no tempo"
     matched = f"{best.get('title', '?')} by {best.get('artist', {}).get('name', '?')}"
-    return str(tempo), f"getsongbpm: {matched}"
+    return f"{bpm:g}", f"getsongbpm: {matched}" + (f" (raw {tempo})" if was_folded else "")
 
 
 # ---------- Commands ----------
@@ -286,11 +298,13 @@ def cmd_export(args):
         print("No GetSongBPM key given, so the BPM column will be left blank for you to fill in.")
 
     # Keep BPMs, keys, energy and follows rules already in the CSV
-    kept = {}
+    kept, kept_vid = {}, {}
     if os.path.exists(args.out):
         with open(args.out, newline="", encoding="utf-8-sig") as f:
             for row in csv.DictReader(f):
                 kept[row["playlist_item_id"]] = {k: row.get(k, "") for k in KEPT}
+                if row.get("video_id"):  # a video removed and re-added comes back under a new item id
+                    kept_vid[row["video_id"]] = kept[row["playlist_item_id"]]
         print(f"Reusing {sum(1 for v in kept.values() if v['bpm'])} BPM values from existing {args.out}")
 
     yt = get_youtube()
@@ -310,7 +324,7 @@ def cmd_export(args):
         channel = sn.get("videoOwnerChannelTitle", "")
         artist, song = guess_artist_song(title, channel)
         artist = credited.get(sn["resourceId"].get("videoId"), artist)
-        old = kept.get(it["id"], {})
+        old = kept.get(it["id"]) or kept_vid.get(sn["resourceId"].get("videoId"), {})
         artist = old.get("artist_guess") or artist  # keep corrections made in the CSV
         if old.get("bpm"):
             bpm, source = old["bpm"], old["bpm_source"]
@@ -335,6 +349,7 @@ def cmd_export(args):
             "key_source": old.get("key_source", ""),
             "energy": old.get("energy", ""),
             "mood": old.get("mood", ""),
+            "energy_source": old.get("energy_source", ""),
         })
         print(f"{sn['position']:>4}  {bpm or '---':>6}  {title}")
 
@@ -608,19 +623,23 @@ def cmd_apply(args):
     target_ids += [i for i in current if i not in seen]  # items added since export go last
 
     moves = plan_moves(current, target_ids)
-    print(f"{len(moves)} moves needed, about {len(moves) * UPDATE_COST} quota units "
-          f"(default daily quota is 10,000).")
+    cost = "" if os.path.exists(YTM_AUTH) else (f", about {len(moves) * UPDATE_COST} quota units "
+                                                "(default daily quota is 10,000)")
+    print(f"{len(moves)} moves needed{cost}.")
     if args.dry_run:
         for pos, item_id in moves:
             print(f"  move to {pos:>4}: {live_by_id[item_id]['snippet']['title']}")
         print("Dry run only, nothing changed.")
         return
+    if not moves:
+        print("Already sorted.")
+        return "done"
 
-    done = 0
+    done = skipped = 0
     ytm = get_ytmusic()
     if ytm:
         print("Moving through YouTube Music (no quota).")
-        _ytm_moves(ytm, pid, live, moves)
+        skipped = _ytm_moves(ytm, pid, live, moves)
         moves = []  # all made; skip the quota-billed path and go straight to the check
     if len(moves) > 20:
         if not _probe_manual(yt, pid, live_by_id, moves[0]):
@@ -660,9 +679,12 @@ def cmd_apply(args):
             break
     if after != target_ids:
         stuck = sum(1 for a, b in zip(after, target_ids) if a == b)
+        fix = (f"{skipped} moves could not be made through YouTube Music (see 'skipped' above). "
+               f"Run 'apply' again, or remove {YTM_AUTH} to move them through the Data API."
+               if skipped else
+               "Set the playlist's Default ordering to Manual in YouTube, then run 'apply' again.")
         print(f"\nWARNING: YouTube reports only {stuck}/{len(target_ids)} tracks in the "
-              "planned position. Set the playlist's Default ordering to Manual in "
-              "YouTube, then run 'apply' again.")
+              f"planned position. {fix}")
         return "unsorted"
     print("\nDone. Playlist is sorted.")
     return "done"
@@ -720,7 +742,8 @@ def _mood_of(bpm):
 
 def mood_for(r):
     """A 'mood' column value wins. Otherwise tempo decides, except that a
-    fast but calm track goes to Mid rather than Hype."""
+    fast but calm track goes to Mid rather than Hype, and a slow but energetic one to Mid
+    rather than Chill."""
     if r.get("mood") in {m[0] for m in MOODS}:
         return r["mood"]
     b = _bpm(r)
@@ -729,6 +752,8 @@ def mood_for(r):
     m = _mood_of(b)
     if m == "Hype" and _energy(r) < HYPE_MIN_ENERGY and "kept fast" not in r.get("bpm_source", ""):
         return "Mid"
+    if m == "Chill" and _energy(r) >= UNFOLD_ENERGY:
+        return "Mid"  # slow but intense (half-time trap, a big build): never Chill
     return m
 
 
@@ -887,15 +912,15 @@ def _sync_mood(yt, mpid, name, want, ytm=None):
     target = [by_vid[v]["id"] for v in want if v in by_vid]
     target += [i for i in current if i not in set(target)]
     moves = plan_moves(current, target)
-    if ytm:
-        _ytm_moves(ytm, mpid, items, moves)
+    unmoved = _ytm_moves(ytm, mpid, items, moves) if ytm else 0
     for pos, item_id in ([] if ytm else moves):
         it = next(i for i in items if i["id"] == item_id)
         _run(yt.playlistItems().update(part="snippet", body={"id": item_id, "snippet": {
             "playlistId": mpid, "resourceId": it["snippet"]["resourceId"], "position": pos}}))
     if moves:
         print(f"  {name}: {len(moves)} moves to fix order")
-    print(f"  {name}: in order", flush=True)
+    print(f"  {name}: " + (f"WARNING {unmoved} moves failed; the next run retries them"
+                           if unmoved else "in order"), flush=True)
 
 
 # ---------- Everything in one go ----------
@@ -916,7 +941,8 @@ def cmd_sync(args):
         print("== export")
         added, removed = cmd_export(ns(playlist=cfg["playlist"], api_key=cfg.get("api_key"),
                                        out=args.csv, delay=0.5))
-        print("== fill"); cmd_fill(ns(csv=args.csv, delay=0.5))
+        # blanks only: re-asking Deezer about every audio estimate daily is slow and finds nothing new
+        print("== fill"); cmd_fill(ns(csv=args.csv, delay=0.5, blanks_only=True))
         print("== analyse"); cmd_analyse(ns(csv=args.csv, api_key=cfg.get("api_key"), delay=0.4))
         print("== apply")
         if cmd_apply(ns(csv=args.csv, descending=False, dry_run=False, arc=False)) != "done":
@@ -972,6 +998,8 @@ def artist_ok(a, b):
     if not ta or not tb:
         return False
     ja, jb = "".join(ta), "".join(tb)
+    if min(len(ja), len(jb)) < 4:  # 'IU' is inside 'Sirius': short names must match as whole words
+        return ja == jb or set(ta) <= set(tb) or set(tb) <= set(ta)
     return (ja in jb or jb in ja or set(ta) == set(tb)
             or difflib.SequenceMatcher(None, ja, jb).ratio() >= 0.75)
 
@@ -1052,9 +1080,11 @@ def _has_latin(s):
     return bool(re.search(r"[A-Za-z]", s or ""))
 
 
+@functools.lru_cache(maxsize=None)  # the tempo, preview and key lookups all ask for the same track
 def _deezer_hit(artist, song):
     """Return (track, 'Title / Artist') for the best Deezer match over several search
     wordings, or (None, why) giving the reason from the most literal search."""
+    # shortcut: a network error is cached too, for the rest of this run; the next run retries.
     first_why = None
     for a, s in _search_variants(artist, song):
         try:
@@ -1079,33 +1109,6 @@ def _deezer_hit(artist, song):
             why = f"deezer: only other songs, e.g. '{hit['title']} / {hit['artist']['name']}'"
         first_why = first_why or why
     return None, first_why or "deezer: no result"
-
-
-def estimate_bpm_from_url(url):
-    """Download a Deezer 30s preview and estimate tempo from its middle 20s."""
-    import os
-    import tempfile
-    import librosa
-    import soundfile as sf
-
-    audio = requests.get(url, timeout=30).content
-    # libsndfile's mp3 sniffing fails on BytesIO, so go through a temp file
-    fd, path = tempfile.mkstemp(suffix=".mp3")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(audio)
-        y, sr = sf.read(path, dtype="float32", always_2d=True)
-    finally:
-        os.unlink(path)
-    y = y.mean(axis=1)
-    # Previews are mid-song clips; trim another 5s each side to dodge fades
-    if len(y) > 20 * sr:
-        edge = 5 * sr
-        y = y[edge:-edge]
-    tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-    # librosa may return a 1-element array
-    import numpy as np
-    return float(np.atleast_1d(tempo)[0])
 
 
 FELT_MAX = 145  # sort by felt tempo: 160 "feels like" 80 to most listeners
@@ -1156,6 +1159,7 @@ def cmd_fill(args):
             time.sleep(args.delay)
             continue
         if (r.get("bpm") or "").strip():
+            time.sleep(args.delay)
             continue  # already estimated from audio; keep it
         try:
             raw, matched = preview_tempo(r["artist_guess"], r["song_guess"])
@@ -1262,7 +1266,7 @@ def preview_tempo(artist, song):
             whys.append(f"{label}: {e}")
             continue
         if tempos:
-            return _median_felt(tempos), f"{label}, {len(tempos)}/4 windows"
+            return _median_felt(tempos), f"{label}, {len(tempos)}/4 windows{_spread(tempos)}"
         whys.append(f"{label}: no beat in any window")
     return None, "; ".join(whys)
 
@@ -1272,15 +1276,18 @@ def _median_felt(tempos):
     return sorted(tempos, key=lambda t: fold_bpm(t)[0])[len(tempos) // 2]
 
 
-def youtube_tempo(video_id):
-    """Last resort: the video's own audio, exactly the version in the playlist. Tempo from
-    20s windows at 20/40/60/80% through it. Returns (raw_bpm, label) or (None, why)."""
+def _spread(tempos):
+    """Note for the CSV when windows read over 5% apart in felt tempo: a row to check by ear."""
+    felt = sorted(fold_bpm(t)[0] for t in tempos)
+    return f", windows disagree: felt {felt[0]:g}-{felt[-1]:g}" if felt[-1] > felt[0] * 1.05 else ""
+
+
+def _youtube_audio(video_id, sr=22050):
+    """The video's own audio as (mono samples, sample_rate). Raises if it cannot be fetched."""
     import shutil
     import subprocess
     import tempfile
     import soundfile as sf
-    if not _ffmpeg():
-        return None, "youtube: needs ffmpeg"
     d = tempfile.mkdtemp()
     try:
         subprocess.run([sys.executable, "-m", "yt_dlp", "-q", "--no-warnings", "--no-playlist",
@@ -1288,19 +1295,28 @@ def youtube_tempo(video_id):
                         f"https://www.youtube.com/watch?v={video_id}"], check=True, timeout=300)
         src = os.path.join(d, os.listdir(d)[0])
         wav = os.path.join(d, "a.wav")
-        subprocess.run([_ffmpeg(), "-y", "-loglevel", "error", "-i", src, "-ac", "1", "-ar", "22050", wav],
+        subprocess.run([_ffmpeg(), "-y", "-loglevel", "error", "-i", src, "-ac", "1", "-ar", str(sr), wav],
                        check=True, timeout=300)
-        y, sr = sf.read(wav, dtype="float32")
-    except (subprocess.SubprocessError, OSError, IndexError) as e:
-        return None, f"youtube: {e}"
+        return sf.read(wav, dtype="float32")
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def youtube_tempo(video_id):
+    """Last resort: the video's own audio, exactly the version in the playlist. Tempo from
+    20s windows at 20/40/60/80% through it. Returns (raw_bpm, label) or (None, why)."""
+    if not _ffmpeg():
+        return None, "youtube: needs ffmpeg"
+    try:
+        y, sr = _youtube_audio(video_id)
+    except Exception as e:
+        return None, f"youtube: {e}"
     w = 20 * sr
     starts = [int(len(y) * f) for f in (0.2, 0.4, 0.6, 0.8)]
     tempos = [t for s in starts if s + w <= len(y) for t in [estimate_tempo(y[s:s + w], sr)] if t > 0]
     if not tempos:
         return None, "youtube: no beat in any window"
-    return _median_felt(tempos), f"youtube audio, {len(tempos)}/4 windows"
+    return _median_felt(tempos), f"youtube audio, {len(tempos)}/4 windows{_spread(tempos)}"
 
 
 def _window_tempos(y, sr):
@@ -1390,18 +1406,52 @@ def unfold_if_energetic(r):
     if not m or b is None or not r.get("energy") or "kept fast" in r["bpm_source"] \
             or float(m.group(1)) <= b or _energy(r) < UNFOLD_ENERGY:
         return False
+    if abs(fold_bpm(float(m.group(1)))[0] - b) > 0.2:
+        return False  # bpm corrected by hand since: it is no longer the halved reading
     r["bpm"] = str(round(b * 2, 1))
     r["bpm_source"] += f" kept fast (energy {r['energy']})"
     return True
+
+
+def _undo_kept_fast(r):
+    """Halve a tempo analyse doubled, so it is decided again from fresh energy (never manual rows)."""
+    m = re.search(r" kept fast \(energy [^)]*\)", r.get("bpm_source", ""))
+    if m and not r["bpm_source"].startswith("manual") and _bpm(r) is not None:
+        r["bpm_source"] = r["bpm_source"].replace(m.group(0), "")
+        r["bpm"] = f"{round(_bpm(r) / 2, 2):g}"
+
+
+FULL_SR = 44100  # previews are 44.1 kHz and energy features depend on the rate: match them
+FULL_TRACK = "youtube: full track"
+AUDIO_TEMPO = ("deezer_preview:librosa", "youtube_audio:librosa")  # tempos estimated from audio
+
+
+def full_track(video_id, win=15):
+    """Energy and tempo from the video's whole audio, so a slow intro, breakdown or outro
+    does not make a hype song read as calm. Energy is the 75th percentile over back-to-back
+    windows (the loud sections define the song); tempo comes from the 4 most energetic windows.
+    Returns (energy, raw_tempo or None, spread note, main-section samples). Raises on failure."""
+    import numpy as np
+    y, sr = _youtube_audio(video_id, sr=FULL_SR)
+    w = win * sr
+    wins = [y[s:s + w] for s in range(0, len(y) - w + 1, w)] or [y]
+    energies = [estimate_energy(x, sr) for x in wins]
+    main = [wins[i] for i in sorted(range(len(wins)), key=lambda i: -energies[i])[:4]]
+    tempos = [t for x in main for t in [estimate_tempo(x, sr)] if t > 0]
+    return (round(float(np.percentile(energies, 75)), 2), _median_felt(tempos) if tempos else None,
+            _spread(tempos) if tempos else "", np.concatenate(main))
 
 
 def cmd_analyse(args):
     with open(args.csv, newline="", encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
     api_key = getattr(args, "api_key", None) or os.environ.get("GETSONGBPM_API_KEY")
+    full = getattr(args, "full", False)
     todo = [r for r in rows if r["title"] not in SKIP_TITLES
-            and (not r.get("key") or not r.get("energy"))]
-    print(f"{len(todo)} rows need key or energy.", flush=True)
+            and (not r.get("key") or not r.get("energy")
+                 or (full and r.get("energy_source") != FULL_TRACK and r.get("video_id")))]
+    print(f"{len(todo)} rows need key or energy" + (" or a full-track measure" if full else "") + ".",
+          flush=True)
 
     def save():
         with open(args.csv, "w", newline="", encoding="utf-8-sig") as f:
@@ -1409,6 +1459,7 @@ def cmd_analyse(args):
             w.writeheader()
             w.writerows(rows)
 
+    fails = 0
     for n, r in enumerate(todo, 1):
         label = f"[{n}/{len(todo)}] {r['title'][:45]}"
         if not r.get("key") and api_key and r.get("bpm_source", "").startswith("getsongbpm"):
@@ -1416,19 +1467,47 @@ def cmd_analyse(args):
             if k:
                 r["key"], r["key_source"] = k, "getsongbpm"
             time.sleep(args.delay)
-        try:
-            y, sr, why = load_preview(r["artist_guess"], r["song_guess"])
-        except Exception as e:
-            y, why = None, f"preview failed: {e}"
-        if y is not None:
-            if not r.get("key"):
-                r["key"], r["key_source"] = estimate_key(y, sr), f"preview: {why}"
-            if not r.get("energy"):
-                r["energy"] = str(estimate_energy(y, sr))
-        print(f"  {r.get('key') or '-':>3}  {r.get('energy') or '-':>6}  {label}"
-              + ("" if y is not None else f"  ({why})"), flush=True)
+        whole, note = None, ""
+        if r.get("video_id") and _ffmpeg():
+            try:
+                whole = full_track(r["video_id"])
+                fails = 0
+            except Exception as e:
+                fails += 1
+                note = f"  (full track failed: {str(e)[:80]})"
+        if whole:
+            energy, raw, spread, main = whole
+            r["energy"], r["energy_source"] = str(energy), FULL_TRACK
+            _undo_kept_fast(r)  # fresh energy decides it again below
+            if raw and r["bpm_source"].startswith(AUDIO_TEMPO):
+                bpm, folded = fold_bpm(raw)
+                if abs(bpm - (_bpm(r) or 0)) > 0.05 * bpm:
+                    note = f"  (tempo {r['bpm']} -> {bpm})"
+                r["bpm"] = str(bpm)
+                r["bpm_source"] = (f"youtube_audio:librosa: full track, main sections{spread}"
+                                   + (f" (raw {raw:.1f})" if folded else ""))
+        y = None
+        if not r.get("key") or not r.get("energy"):
+            try:
+                y, sr, why = load_preview(r["artist_guess"], r["song_guess"])
+            except Exception as e:
+                y, why = None, f"preview failed: {e}"
+            if y is None and whole:  # no preview anywhere: the track's own main sections
+                y, sr, why = whole[3], FULL_SR, "youtube audio"
+            if y is not None:
+                if not r.get("key"):
+                    r["key"], r["key_source"] = estimate_key(y, sr), f"preview: {why}"
+                if not r.get("energy"):
+                    r["energy"], r["energy_source"] = str(estimate_energy(y, sr)), f"preview: {why}"
+            else:
+                note += f"  ({why})"
+        print(f"  {r.get('key') or '-':>3}  {r.get('energy') or '-':>6}  {label}{note}", flush=True)
         if n % 20 == 0:
             save()
+        if fails >= 10:
+            print("YouTube downloads keep failing (blocked for a while?). Stopping; "
+                  "run 'analyse --full' again later to continue.")
+            break
         time.sleep(args.delay)
     fast = [r for r in rows if unfold_if_energetic(r)]
     for r in fast:
@@ -1466,6 +1545,8 @@ def main():
     an.add_argument("csv", nargs="?", default="playlist_bpm.csv")
     an.add_argument("--api-key", help="GetSongBPM API key, used for keys where it has them")
     an.add_argument("--delay", type=float, default=0.4)
+    an.add_argument("--full", action="store_true",
+                    help="Re-measure every track from its whole YouTube audio (resumable)")
     an.set_defaults(func=cmd_analyse)
 
     mo = sub.add_parser("moods", help="Build Chill / Mid / Hype playlists in the same order")
@@ -1480,6 +1561,8 @@ def main():
     lg.set_defaults(func=cmd_login)
 
     args = p.parse_args()
+    for stream in (sys.stdout, sys.stderr):  # Windows falls back to cp1252 when output is
+        stream.reconfigure(encoding="utf-8", errors="replace")  # redirected: Korean titles crash it
     args.func(args)
 
 

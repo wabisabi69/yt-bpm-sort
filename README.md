@@ -4,14 +4,22 @@ Reorders a personal YouTube playlist by felt tempo, slowest first, and refines t
 
 ## How it works
 
-1. `export` fetches the playlist, guesses artist and song from each video title, looks up the tempo on GetSongBPM, and writes `playlist_bpm.csv`.
-2. `fill` estimates tempo for rows GetSongBPM could not match, from the track's public 30 second preview on Deezer, analysed locally with librosa. Very fast readings (145 BPM and up) are halved to the felt tempo.
-3. `analyse` adds a musical key (Camelot notation) and an energy score for each track, from GetSongBPM where it has the key and from the preview otherwise (Deezer, or iTunes for tracks Deezer lacks).
-4. You review the CSV and correct anything that looks wrong.
+1. `export` fetches the playlist, guesses artist and song from each video title, looks up the tempo on GetSongBPM, and writes `playlist_bpm.csv`. Half-time readings under 70 BPM are doubled.
+2. `fill` finds a tempo for rows GetSongBPM could not match. It tries, in order: Deezer's own measured tempo, the track's 30 second preview on Deezer and then iTunes analysed locally with librosa, and last the video's own audio. Readings above 145 BPM are halved to the felt tempo. `fill` also re-checks earlier audio estimates against Deezer; `fill --blanks-only` skips that.
+3. `analyse` adds a musical key (Camelot notation) and an energy score for each track. Energy is measured on the video's whole audio: the track is cut into 15 second windows and scored on its louder sections (75th percentile), so a slow intro, breakdown or outro does not make a hype song read as calm. Tempos estimated from audio are re-measured on the 4 most energetic windows. Keys come from GetSongBPM where it has them, otherwise from the preview. A halved tempo is doubled back when the track is energetic (energy 0.5 or more) and marked "kept fast". `analyse --full` re-measures every track this way; it is resumable.
+4. You review the CSV and correct anything that looks wrong (see below).
 5. `apply` reorders the live playlist to match, using the fewest moves possible.
-6. `moods` keeps one private playlist per mood: Chill (under 90 BPM), Mid (90 to 120) and Hype (120 and up).
+6. `moods` keeps one private playlist per mood: Chill (under 90 BPM), Mid (90 to 120) and Hype (120 and up). A track at Hype tempo with below-average energy goes to Mid, unless it is marked "kept fast"; a track at Chill tempo with high energy (0.5 or more) goes to Mid too.
 
 `sync` runs all of these in order and is safe to run every day.
+
+## Reviewing the CSV
+
+- `energy_source` says whether energy came from the full track or only a preview.
+- `bpm_source` says where each tempo came from. Tempos estimated from audio (`deezer_preview:librosa`, `youtube_audio:librosa`) are the least reliable; rows marked "windows disagree" read differently in different parts of the clip and are the first to check by ear.
+- To correct a tempo, change `bpm` and set `bpm_source` to something starting with `manual`, so `fill` never replaces it.
+- `mood` forces a track into `Chill`, `Mid` or `Hype` whatever its tempo.
+- `follows` names a track this one must directly follow.
 
 ## The order
 
@@ -25,7 +33,7 @@ Reorders a personal YouTube playlist by felt tempo, slowest first, and refines t
 
 1. Create a Google Cloud project, enable the YouTube Data API v3, and create an OAuth client of type **Desktop app**. Download the client JSON and save it next to the script as `client_secret.json`.
 2. While the OAuth consent screen is in testing mode, add your Google account as a test user.
-3. Install dependencies, plus ffmpeg on your PATH for iTunes previews:
+3. Install dependencies, plus ffmpeg on your PATH for iTunes previews and YouTube audio. Use a Python version librosa has wheels for (3.11 works; the newest release may not yet):
 
    ```
    pip install -r requirements.txt
@@ -57,11 +65,22 @@ Or all at once, with a `config.json` next to the script:
 python yt_bpm_sort.py sync
 ```
 
-Re-running `export` keeps BPMs, keys, energy and follows rules already in the CSV, so manual corrections survive.
+Re-running `export` keeps BPMs, keys, energy, moods and follows rules already in the CSV, so manual corrections survive, also when a video is removed from the playlist and added back.
+
+If the Google login expires, `python yt_bpm_sort.py login` signs in again.
 
 ## Quota notes
 
 The YouTube Data API default quota is 10,000 units per day, and it resets at midnight Pacific time. Each move, add or remove costs 50 units, so roughly 200 per day. Every command stops cleanly at the quota and picks up from the live playlist state on the next run.
+
+## Sorting without the quota (optional)
+
+A first sort of a long playlist takes days at 200 moves a day. With a `browser.json` next to the script, `apply` and `moods` write through YouTube Music's web API instead, which is not billed against the quota (reads still use the Data API, at about 1 unit per 50 tracks).
+
+1. Sign in at music.youtube.com, open the browser's developer tools, and copy the request headers of any `browse` POST request. The [ytmusicapi guide](https://ytmusicapi.readthedocs.io/en/stable/setup/browser.html) shows how.
+2. Run `ytmusicapi browser` next to the script and paste the headers. It writes `browser.json`.
+
+`browser.json` holds your login cookies: treat it like a password. It is in `.gitignore`. Signing out of YouTube Music in that browser ends it; the script then says so and goes back to the Data API.
 
 ## Credits
 
