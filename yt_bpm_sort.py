@@ -1451,7 +1451,8 @@ def cmd_analyse(args):
     full = getattr(args, "full", False)
     todo = [r for r in rows if r["title"] not in SKIP_TITLES
             and (not r.get("key") or not r.get("energy")
-                 or (full and r.get("energy_source") != FULL_TRACK and r.get("video_id")))]
+                 or (full and not (r.get("energy_source") or "").startswith(FULL_TRACK)
+                     and r.get("video_id")))]  # also done: 'youtube: full track (other upload ...)'
     print(f"{len(todo)} rows need key or energy" + (" or a full-track measure" if full else "") + ".",
           flush=True)
 
