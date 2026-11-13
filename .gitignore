@@ -11,3 +11,4 @@ config.json
 moods.json
 order_watch.log
 browser.json
+removed_repeats.json
