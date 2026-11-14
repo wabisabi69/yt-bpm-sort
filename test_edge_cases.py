@@ -112,4 +112,26 @@ assert r == {"bpm": "80.7", "bpm_source": "deezer_bpm: X (raw 161.5)"}, r
 r = {"bpm": "166.8", "bpm_source": "manual: user counts double-time of 83.4, kept fast"}
 y._undo_kept_fast(r)
 assert r["bpm"] == "166.8"
+
+# 12. Lyrics: YouTube Music lyrics beat LRCLIB's instrumental tags (Conquest of Paradise), but a
+# song without them there is instrumental even when LRCLIB lists sung namesakes (Children).
+assert y.lyrics_verdict("Conquest of Paradise", True, 7, 13)[0] == "yes"
+assert y.lyrics_verdict("Children (Dream Version)", False, 12, 8)[0] == "no"
+assert y.lyrics_verdict("Roi (Instrumental Slowed)", True, 0, 3)[0] == "no"
+assert y.lyrics_verdict("Song", None, 5, 2)[0] == "yes"  # no login: LRCLIB majority
+assert y.lyrics_verdict("Song", False, 0, 0) == ("", "not found")
+
+# 13. Instrumental enough: under 20 sung words a minute (a sampled hook: Levels, 56 words in 3:20),
+# or under 10 different words a minute (one hook on repeat: In My Mind, 95 words but 7.5 different).
+assert y._seconds("3:20") == 200 and y._seconds(None) is None
+assert y.lyric_rates("[Chorus]\nOh, sometimes I get a good feeling", 60) == (7, 7)
+assert y.lyric_rates("la la la la", 60) == (4, 1)
+assert y.lyric_rates("一路生花", 60) == (4, 4)  # no spaces in Chinese: count characters
+assert y.lyric_rates("", 60) is None and y.lyric_rates("la la", None) is None
+assert y.lyrics_verdict("Levels", True, 20, 0, ytm_rates=(16.8, 9)) == \
+    ("no", "youtube music: 16.8 words/min, 9 different")
+assert y.lyrics_verdict("In My Mind", True, 20, 0, ytm_rates=(95.2, 7.5))[0] == "no"
+assert y.lyrics_verdict("Talking to the Moon", True, 20, 0, ytm_rates=(67.2, 30))[0] == "yes"
+assert y.lyrics_verdict("Song", None, 3, 0, lrclib_rates=(12, 8))[0] == "no"
+assert y.lyrics_verdict("Children", False, 12, 8, lrclib_rates=(90, 40))[0] == "no"  # namesakes' words ignored
 print("ok")

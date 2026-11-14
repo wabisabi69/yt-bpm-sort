@@ -7,9 +7,10 @@ Reorders a personal YouTube playlist by felt tempo, slowest first, and refines t
 1. `export` fetches the playlist, guesses artist and song from each video title, looks up the tempo on GetSongBPM, and writes `playlist_bpm.csv`. Half-time readings under 70 BPM are doubled.
 2. `fill` finds a tempo for rows GetSongBPM could not match. It tries, in order: Deezer's own measured tempo, the track's 30 second preview on Deezer and then iTunes analysed locally with librosa, and last the video's own audio. Readings above 145 BPM are halved to the felt tempo. `fill` also re-checks earlier audio estimates against Deezer; `fill --blanks-only` skips that.
 3. `analyse` adds a musical key (Camelot notation) and an energy score for each track. Energy is measured on the video's whole audio: the track is cut into 15 second windows and scored on its louder sections (75th percentile), so a slow intro, breakdown or outro does not make a hype song read as calm. Tempos estimated from audio are re-measured on the 4 most energetic windows. Keys come from GetSongBPM where it has them, otherwise from the preview. A halved tempo is doubled back when the track is energetic (energy 0.5 or more) and marked "kept fast". `analyse --full` re-measures every track this way; it is resumable.
-4. You review the CSV and correct anything that looks wrong (see below).
-5. `apply` reorders the live playlist to match, using the fewest moves possible.
-6. `moods` keeps one private playlist per mood: Chill (under 90 BPM), Mid (90 to 120) and Hype (120 and up). A track at Hype tempo with below-average energy goes to Mid, unless it is marked "kept fast"; a track at Chill tempo with high energy (0.5 or more) goes to Mid too.
+4. `lyrics` sets `lyrics` = `no` for instrumentals, for tracks with fewer than 20 sung words a minute (background voices, a sampled hook), and for tracks with fewer than 10 different words a minute (one hook on repeat). Words a minute come from the lyrics YouTube Music links to the video (needs `browser.json`) and the track's length. Without those, LRCLIB's instrumental tags decide, then LRCLIB's lyrics. A title saying "Instrumental" always counts. Songs neither source knows stay blank. `lyrics --recheck` checks every row again except ones set by hand.
+5. You review the CSV and correct anything that looks wrong (see below).
+6. `apply` reorders the live playlist to match, using the fewest moves possible.
+7. `moods` keeps one private playlist per mood: Chill (under 90 BPM), Mid (90 to 120) and Hype (120 and up). A track at Hype tempo with below-average energy goes to Mid, unless it is marked "kept fast"; a track at Chill tempo with high energy (0.5 or more) goes to Mid too. It also keeps an Instrumental playlist of every track whose `lyrics` is `no`, in the main playlist's order.
 
 `sync` runs all of these in order and is safe to run every day.
 
@@ -20,6 +21,7 @@ Reorders a personal YouTube playlist by felt tempo, slowest first, and refines t
 - To correct a tempo, change `bpm` and set `bpm_source` to something starting with `manual`, so `fill` never replaces it.
 - `mood` forces a track into `Chill`, `Mid` or `Hype` whatever its tempo.
 - `follows` names a track this one must directly follow.
+- `lyrics` set to `no` puts a track in the Instrumental playlist, `yes` keeps it out. A blank `lyrics` with `lyrics_source` "not found" means neither source knew the song. Adding or removing a track in the Instrumental playlist in YouTube does the same: the next `moods` run notices and sets `lyrics` with a `manual` source. A different upload of a song already in the main playlist is swapped for the main playlist's copy. A track that is not in the main playlist at all stays, unsorted, at the end.
 
 ## The order
 
@@ -50,6 +52,7 @@ Step by step:
 python yt_bpm_sort.py export "<playlist URL or ID>" --api-key <GETSONGBPM_KEY>
 python yt_bpm_sort.py fill
 python yt_bpm_sort.py analyse --api-key <GETSONGBPM_KEY>
+python yt_bpm_sort.py lyrics
 python yt_bpm_sort.py apply --dry-run
 python yt_bpm_sort.py apply
 python yt_bpm_sort.py moods

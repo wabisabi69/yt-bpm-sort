@@ -37,10 +37,10 @@ GETSONGBPM_URL = "https://api.getsong.co/search/"
 UPDATE_COST = 50  # quota units per playlistItems.update
 FIELDS = ["playlist_id", "position", "playlist_item_id", "video_id", "title",
           "channel", "artist_guess", "song_guess", "bpm", "bpm_source", "follows",
-          "key", "key_source", "energy", "mood", "energy_source"]
+          "key", "key_source", "energy", "mood", "energy_source", "lyrics", "lyrics_source"]
 # Columns a re-export carries over from the previous CSV for the same item
 KEPT = ["bpm", "bpm_source", "follows", "key", "key_source", "energy", "mood", "artist_guess",
-        "energy_source"]
+        "energy_source", "lyrics", "lyrics_source"]
 SKIP_TITLES = {"Deleted video", "Private video"}
 
 
@@ -350,6 +350,8 @@ def cmd_export(args):
             "energy": old.get("energy", ""),
             "mood": old.get("mood", ""),
             "energy_source": old.get("energy_source", ""),
+            "lyrics": old.get("lyrics", ""),
+            "lyrics_source": old.get("lyrics_source", ""),
         })
         print(f"{sn['position']:>4}  {bpm or '---':>6}  {title}")
 
@@ -728,6 +730,7 @@ def _run(request, tries=6):
 MOODS_FILE = "moods.json"
 # Felt BPM ranges, in the order they are built (each finishes before the next starts)
 MOODS = [("Hype", 120, None), ("Mid", 90, 120), ("Chill", None, 90)]
+INSTRUMENTAL = "Instrumental"  # extra playlist: rows whose lyrics column says "no"
 
 
 HYPE_MIN_ENERGY = 0.0  # Hype must also be at least averagely energetic
@@ -766,6 +769,43 @@ def cmd_moods(args):
         rows = list(csv.DictReader(f))
     pid = rows[0]["playlist_id"]
     yt = get_youtube()
+    store = json.load(open(MOODS_FILE)) if os.path.exists(MOODS_FILE) else {}
+    ids = store.setdefault(pid, {})
+    synced = store.setdefault("synced", {})  # Instrumental playlist id -> video ids the last run left in it
+
+    # Hand edits in YouTube win: a track added to the Instrumental playlist since the last run
+    # gets lyrics 'no', one removed gets 'yes'. Tracks not in the main playlist stay, at the end.
+    # Runs before build_target, which can blank a 'follows' value that must not be saved.
+    # shortcut: a video YouTube refused to add looks removed by hand; rare, fix its CSV row if so.
+    keep_extra = []
+    if INSTRUMENTAL in ids:
+        snips = {i["snippet"]["resourceId"].get("videoId"): i["snippet"] for i in fetch_items(yt, ids[INSTRUMENTAL])}
+        now = set(snips)
+        last = set(synced.get(ids[INSTRUMENTAL], []))
+        by_vid = {r["video_id"]: r for r in rows if r.get("video_id")}
+        for v in now - set(by_vid):  # another upload of a song in the main playlist stands for it: no repeats
+            sn = snips[v]
+            artist = guess_artist_song(sn["title"], sn.get("videoOwnerChannelTitle", ""))[0]
+            twin = next((r for r in by_vid.values() if dup_key(sn) and dup_key(r) == dup_key(sn)
+                         and artist_ok(r["artist_guess"], artist)), None)
+            if twin:
+                now = now - {v} | {twin["video_id"]}
+                print(f"{INSTRUMENTAL}: '{sn['title'][:45]}' is another upload of '{twin['title'][:45]}' "
+                      "from the main playlist; using that one")
+        edits = [(v, "no", "added to") for v in now - last if v in by_vid and by_vid[v].get("lyrics") != "no"]
+        edits += [(v, "yes", "removed from") for v in last - now if v in by_vid and by_vid[v].get("lyrics") == "no"]
+        for vid, val, how in edits:
+            r = by_vid[vid]
+            r["lyrics"], r["lyrics_source"] = val, f"manual: {how} the Instrumental playlist by hand"
+            print(f"{INSTRUMENTAL}: '{r['title'][:45]}' {how} by hand, lyrics -> {val}")
+        if edits:
+            with open(args.csv, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
+                w.writeheader()
+                w.writerows(rows)
+        keep_extra = sorted(v for v in now if v not in by_vid)
+        for vid in keep_extra:
+            print(f"{INSTRUMENTAL}: {vid} is not in the main playlist; kept at the end (add it there to sort it)")
 
     live = [i["id"] for i in fetch_items(yt, pid)]
     pos = {item_id: n for n, item_id in enumerate(live)}
@@ -819,16 +859,26 @@ def cmd_moods(args):
                 after = next((order[j] for j in range(k - 1, -1, -1) if order[j] in desired[name]), None)
                 desired[name].insert(desired[name].index(after) + 1 if after else 0, vid)
 
-    store = json.load(open(MOODS_FILE)) if os.path.exists(MOODS_FILE) else {}
-    ids = store.setdefault(pid, {})
+    # Plus every track without lyrics, in the main playlist's order (felt BPM ascending)
+    desired[INSTRUMENTAL] = []
+    for r in ordered:
+        vid = r.get("video_id")
+        if r.get("lyrics") == "no" and vid and vid not in desired[INSTRUMENTAL] and r["title"] not in SKIP_TITLES:
+            desired[INSTRUMENTAL].append(vid)
+    desired[INSTRUMENTAL] += keep_extra
+    titles = {name: f"{name} ({f'under {hi}' if lo is None else (f'{lo}+' if hi is None else f'{lo}-{hi}')} BPM)"
+              for name, lo, hi in MOODS}
+    titles[INSTRUMENTAL] = f"Instrumental (under {LYRICS_WPM} sung words a minute, by BPM)"
+
     main_title = yt.playlists().list(part="snippet", id=pid).execute()["items"][0]["snippet"]["title"]
     ytm = get_ytmusic()
 
     try:
-        for name, lo, hi in MOODS:
-            rng = f"under {hi}" if lo is None else (f"{lo}+" if hi is None else f"{lo}-{hi}")
+        for name in desired:
+            if name not in ids and not desired[name]:
+                continue  # e.g. no lyrics column yet: no empty playlist
             if name not in ids:
-                body = {"snippet": {"title": f"{main_title} - {name} ({rng} BPM)",
+                body = {"snippet": {"title": f"{main_title} - {titles[name]}",
                                     "description": f"{name} tracks from '{main_title}', "
                                                    "ordered by felt tempo, key and energy."},
                         "status": {"privacyStatus": "private"}}
@@ -836,6 +886,9 @@ def cmd_moods(args):
                 json.dump(store, open(MOODS_FILE, "w"), indent=1)
                 print(f"Created playlist '{body['snippet']['title']}'")
             _sync_mood(yt, ids[name], name, desired[name], ytm)
+            if name == INSTRUMENTAL:
+                synced[ids[name]] = desired[name]
+                json.dump(store, open(MOODS_FILE, "w"), indent=1)
     except HttpError as e:
         if _is_quota(e):
             print("\nHit the daily quota while building mood playlists. "
@@ -923,13 +976,121 @@ def _sync_mood(yt, mpid, name, want, ytm=None):
                            if unmoved else "in order"), flush=True)
 
 
+# ---------- Lyrics ----------
+
+LYRICS_WPM = 20  # fewer sung words a minute (a sampled hook, background voices) counts as instrumental
+DISTINCT_WPM = 10  # so do fewer different words a minute (one hook on repeat), however often sung
+_CJK = "぀-ヿ㐀-鿿"
+
+
+def lyric_rates(text, seconds):
+    """(words, different words) a minute of song in a lyrics text; [Chorus]-style labels dropped,
+    each Chinese or Japanese character counted as a word. None without text or length."""
+    text = re.sub(r"\[[^\]]*\]", " ", text or "")
+    if not text.strip() or not seconds:
+        return None
+    words = [w.lower() for w in re.findall(rf"[{_CJK}]|[^\W\d_{_CJK}]+", text)]
+    mins = float(seconds) / 60
+    return round(len(words) / mins, 1), round(len(set(words)) / mins, 1)
+
+
+def _few_words(rates, where):
+    wpm, distinct = rates
+    return ("no" if wpm < LYRICS_WPM or distinct < DISTINCT_WPM else "yes",
+            f"{where}: {wpm:g} words/min, {distinct:g} different")
+
+
+def _seconds(length):
+    """'3:20' -> 200"""
+    try:
+        return sum(int(x) * 60 ** i for i, x in enumerate(reversed(length.split(":"))))
+    except (AttributeError, ValueError):
+        return None
+
+
+def lrclib_counts(artist, song):
+    """(versions with lyrics, versions marked instrumental, lyric_rates of the median version
+    with lyrics) of this song on LRCLIB, artist checked."""
+    for a, s in _search_variants(artist, song):
+        try:
+            resp = requests.get("https://lrclib.net/api/search", params={"track_name": s, "artist_name": a},
+                                headers={"User-Agent": "yt-bpm-sort"}, timeout=20)
+            hits = resp.json() if resp.status_code == 200 else []
+        except (requests.RequestException, ValueError):
+            continue
+        ok = [h for h in hits if artist_ok(h.get("artistName") or "", a) and title_ok(h.get("trackName") or "", s)]
+        if ok:
+            lyr = [h for h in ok if (h.get("plainLyrics") or "").strip()]
+            rates = sorted(x for h in lyr for x in [lyric_rates(h["plainLyrics"], h.get("duration"))] if x)
+            return len(lyr), sum(1 for h in ok if h.get("instrumental")), (rates[len(rates) // 2] if rates else None)
+    return 0, 0, None
+
+
+def lyrics_verdict(title, ytm_lyrics, lyr, ins, lrclib_rates=None, ytm_rates=None):
+    """('no' = instrumental, few words or one repeated hook; 'yes'; or '' = unknown; source).
+    YouTube Music's lyrics are linked to the video itself, so they decide first; LRCLIB also
+    lists covers and namesakes with words."""
+    if re.search(r"\binstrumental\b", title, re.I):
+        return "no", "title"
+    if ytm_rates is not None:
+        return _few_words(ytm_rates, "youtube music")
+    if ytm_lyrics:
+        return "yes", "youtube music"
+    if ins and (ytm_lyrics is False or ins >= lyr):
+        return "no", (f"lrclib: {ins} instrumental, {lyr} with lyrics"
+                      + ("; none on youtube music" if ytm_lyrics is False else ""))
+    if lrclib_rates is not None:
+        return _few_words(lrclib_rates, "lrclib")
+    if lyr:
+        return "yes", f"lrclib: {lyr} with lyrics"
+    return "", "not found"
+
+
+def cmd_lyrics(args):
+    """Fill the lyrics column ('no' marks an instrumental) for rows not checked yet, or with
+    --recheck for every row not set by hand ('manual...' source)."""
+    with open(args.csv, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+    src = lambda r: r.get("lyrics_source") or ""
+    by_hand = lambda r: src(r).startswith("manual") or (r.get("lyrics") and not src(r))
+    todo = [r for r in rows if r["title"] not in SKIP_TITLES and not by_hand(r)
+            and (getattr(args, "recheck", False) or not src(r))]
+    print(f"{len(todo)} rows need a lyrics check.", flush=True)
+
+    def save():
+        with open(args.csv, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(rows)
+
+    ytm = get_ytmusic() if todo else None
+    for n, r in enumerate(todo, 1):
+        linked, ytm_rates = None, None  # unknown without a YouTube Music login
+        if ytm and r.get("video_id"):
+            try:
+                w = ytm.get_watch_playlist(videoId=r["video_id"], limit=1)
+                linked = bool(w.get("lyrics"))
+                if linked:
+                    ytm_rates = lyric_rates((ytm.get_lyrics(w["lyrics"]) or {}).get("lyrics"),
+                                            _seconds((w.get("tracks") or [{}])[0].get("length")))
+            except Exception:
+                pass
+        r["lyrics"], r["lyrics_source"] = lyrics_verdict(
+            r["title"], linked, *lrclib_counts(r["artist_guess"], r["song_guess"]), ytm_rates=ytm_rates)
+        print(f"  [{n}/{len(todo)}] {r['lyrics'] or '?':>3}  {r['title'][:45]}  ({r['lyrics_source']})", flush=True)
+        if n % 20 == 0:
+            save()
+        time.sleep(args.delay)
+    save()
+
+
 # ---------- Everything in one go ----------
 
 CONFIG_FILE = "config.json"
 
 
 def cmd_sync(args):
-    """export, fill, analyse, apply, moods. Safe to run daily: each step only
+    """export, fill, analyse, lyrics, apply, moods. Safe to run daily: each step only
     does what is outstanding and stops cleanly at the quota."""
     import json
     if not os.path.exists(CONFIG_FILE):
@@ -944,6 +1105,7 @@ def cmd_sync(args):
         # blanks only: re-asking Deezer about every audio estimate daily is slow and finds nothing new
         print("== fill"); cmd_fill(ns(csv=args.csv, delay=0.5, blanks_only=True))
         print("== analyse"); cmd_analyse(ns(csv=args.csv, api_key=cfg.get("api_key"), delay=0.4))
+        print("== lyrics"); cmd_lyrics(ns(csv=args.csv, delay=0.2))
         print("== apply")
         if cmd_apply(ns(csv=args.csv, descending=False, dry_run=False, arc=False)) != "done":
             return
@@ -1552,11 +1714,17 @@ def main():
                     help="Re-measure every track from its whole YouTube audio (resumable)")
     an.set_defaults(func=cmd_analyse)
 
-    mo = sub.add_parser("moods", help="Build Chill / Mid / Hype playlists in the same order")
+    ly = sub.add_parser("lyrics", help="Mark tracks without lyrics (LRCLIB, YouTube Music)")
+    ly.add_argument("csv", nargs="?", default="playlist_bpm.csv")
+    ly.add_argument("--delay", type=float, default=0.2)
+    ly.add_argument("--recheck", action="store_true", help="Check every row again, except ones set by hand")
+    ly.set_defaults(func=cmd_lyrics)
+
+    mo = sub.add_parser("moods", help="Build Chill / Mid / Hype / Instrumental playlists in the same order")
     mo.add_argument("csv", nargs="?", default="playlist_bpm.csv")
     mo.set_defaults(func=cmd_moods)
 
-    sy = sub.add_parser("sync", help="export, fill, analyse, apply and moods in one go (uses config.json)")
+    sy = sub.add_parser("sync", help="export, fill, analyse, lyrics, apply and moods in one go (uses config.json)")
     sy.add_argument("csv", nargs="?", default="playlist_bpm.csv")
     sy.set_defaults(func=cmd_sync)
 
